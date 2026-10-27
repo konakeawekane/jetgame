@@ -115,7 +115,7 @@ Use this document to track all art, audio, interface, design, and technical mate
 ### In-Game Spawn Menu
 
 - [ ] Team and spawn selector
-- [ ] Jet/loadout selector
+- [ ] Jet selector (guns and missiles are standard equipment; no spawn weapon selection)
 - [ ] Spawn control
 - [ ] Spectator or unavailable-spawn states, if used
 

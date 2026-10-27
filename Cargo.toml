@@ -14,6 +14,5 @@ env_logger = "0.10"
 glam = "0.27"
 gltf = { version = "1.4", default-features = false, features = ["utils"] }
 thiserror = "1"
-
-[dev-dependencies]
 png = "0.17"
+cpal = "0.15"

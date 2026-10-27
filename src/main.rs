@@ -7,9 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--smoke-test" => options.smoke_test = true,
+            "--preview" => options.preview = true,
             "--mesh" => options.mesh = args.next().ok_or("--mesh requires a file path")?.into(),
             "--help" | "-h" => {
-                println!("JetGame [--mesh FILE.glb] [--smoke-test]");
+                println!("JetGame [--mesh FILE.glb] [--preview] [--smoke-test]");
                 return Ok(());
             }
             _ => return Err(format!("Unknown option: {arg}").into()),

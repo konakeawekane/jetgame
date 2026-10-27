@@ -10,11 +10,12 @@ Blinn-Phong material. It supplies ambient light, directional diffuse light, and
 a specular highlight. Mesh position/normal data and object transforms feed the
 same shader for jets, terrain, and other standard 3D objects.
 
-The application opens a resizable 1280x720 development window and displays the
-supplied F-16 model. The camera automatically frames the loaded geometry without
-changing its scale. Depth testing and back-face culling are enabled. All meshes
+The application opens a resizable 1280x720 window with a splash screen and start
+menu. Gameplay now flies the supplied F-16 over the terrain with a following
+camera and three local opponents. Depth testing and back-face culling are enabled. All meshes
 receive the same gray material; embedded material assignments, textures, vertex
-colors, and HDR skies are deliberately unused at this stage.
+colors, and HDR skies are deliberately unused for 3D meshes at this stage. The UI
+uses a separate unlit overlay with its own small image/font atlas.
 
 Windows uses Direct3D 12 after default backend probing caused a native startup
 crash on the development machine. Other platforms use wgpu's primary backends.
@@ -33,13 +34,103 @@ Run commands from the project root:
 ```powershell
 cargo run
 cargo run --release
-cargo run -- --mesh assets/world_01.glb
-cargo run -- --mesh assets/rocket.glb
+cargo run -- --preview
+cargo run -- --preview --mesh assets/f-16_fighter_jet.glb
 cargo run -- --smoke-test
+cargo run -- --preview --smoke-test
 ```
 
-`--mesh FILE.glb` selects the displayed mesh. `--smoke-test` exits successfully
-after three presented frames. These options can be combined. `--help` lists them.
+`--mesh FILE.glb` selects the aircraft mesh. `--preview` enters local gameplay
+directly. `--smoke-test` exits successfully after three presented frames.
+These options can be combined. `--help` lists them.
+
+## User interface
+
+All eleven screens from `UserInterface.md` are implemented: splash, start,
+settings, browser, joining, hosting, waiting lobby, spawn, gameplay, pause, and
+match report. The existing splash/menu PNGs are used; missing UI artwork falls
+back to plain panels. An original bitmap font supplies placeholder text.
+
+- Up/Down moves focus; Left/Right adjusts values or moves focus between buttons.
+- Enter activates the focused control, like a left click. Mouse clicks work too.
+- Click a `<` chevron to decrease a value; click the value or `>` to advance it.
+- P opens the pause menu during gameplay and resumes from that menu.
+- Escape goes back. Host Cancel and leaving a session return to the browser.
+- Host name: Enter/click to edit, type ASCII text, Backspace to erase, Enter to finish.
+- Settings opened from pause return to pause. Local gameplay pauses while menus are open.
+
+The browser is explicitly an offline demo. Join the first listed server to enter
+the waiting lobby; mark Ready, then select Preview Match Start. The second server
+demonstrates joining an active match and goes directly to spawn. Hosting creates
+a local placeholder lobby. Select Spawn to fly. Respawn and End Match operate on
+the local round; Simulate Link Loss remains a way to exercise the disconnect flow.
+
+Host map/mode/player-limit choices are reflected in the lobby. They do not yet
+select a different local game mode or level. All four documented control schemes
+now operate the aircraft. Master Volume controls synthesized radar warnings;
+Music Volume is reserved for a future music player. VSync applies immediately.
+Settings are not persisted yet. Roster entries remain placeholders; gameplay HUD
+speed, altitude, health, ammunition, radar state, and round statistics are live.
+
+Future networking can deliver `ui::SessionEvent` values for connecting, match
+start/end, aircraft destruction, and connection loss. A connection-loss event
+returns to the browser from any screen and clears the session.
+
+UI rendering uses one alpha-blended instanced draw call, a 1024x1024 RGBA atlas
+(4 MiB GPU allocation), and a reusable quad buffer. Images are reduced before
+upload; their original decoded pixels are released. A retained display list is
+rebuilt/uploaded only after a UI change. Full-screen menus skip the 3D draw and
+depth clear, and unchanged menus do not redraw. Small timer updates run at 30 Hz;
+the current gameplay redraw loop targets 120 Hz. Resolution-independent layout
+and hit testing share a letterboxed 1280x720 logical canvas.
+
+## Local gameplay
+
+Every aircraft starts with guns selected, 800 gun rounds, and 8 missiles. Spawn
+does not select a weapon. F switches guns/missiles; Space fires. Gun cadence is
+12 shots/second for the player; missile cooldown is 0.9 seconds. Switching weapons
+does not bypass the current cooldown. Respawning restores both weapons and ammo.
+
+Radar scans automatically, independently of weapon selection. An enemy within
+2,800 m and the 30-degree acquisition half-cone must remain visible for 1.25 seconds.
+Tracking then permits a 45-degree half-cone. Terrain and placeholder cover block
+line of sight. Range, angle, occlusion, death, or a different target life break
+the lock. Both pilots have per-aircraft outgoing/incoming lock state; the local
+pilot hears different lock and missile-warning tones. There is no remote audio
+client until networking is implemented.
+
+Missiles can fire with no lock and then fly unguided. A shot launched with a
+lock receives a target and homes independently after the launching radar loses
+lock. Invalid/dead targets stop guidance. Missiles turn at a limited rate, can
+hit terrain, and expire; they are not guaranteed hits.
+
+The local round has three simple opponents, health/damage, terrain/cover/aircraft
+collision, impacts/explosions, respawning, and live results. First to five player
+kills or three minutes ends the round. Opponents respawn after five seconds.
+Crossing the combat boundary gives eight seconds to return. P/Escape pauses;
+losing focus pauses and clears held input. Mouse schemes capture the cursor;
+opening a menu releases it. The mouse virtual joystick remains sticky during
+flight, and simple mouse steering honors manual yaw/roll overrides.
+
+Physics uses a local six-degree-of-freedom rigid body with mass, diagonal inertia,
+quaternion orientation, thrust, gravity, lift, drag, and control torque. Automatic
+lift trim, side-slip damping, coordinated banking, and softened stall/control
+authority make it forgiving. Lift uses the standard
+[dynamic-pressure lift relation](https://www1.grc.nasa.gov/beginners-guide-to-aeronautics/lift-equation-2/);
+the coefficients and assistance are gameplay tuning rather than a calibrated F-16
+simulation. Integration background: [rigid-body physics](https://gafferongames.com/post/physics_in_3d/).
+`flight::FlightTuning` contains the main tuning values. Simulation runs at a fixed
+120 Hz with a bounded catch-up step, independently of rendering cadence.
+
+The supplied arbitrary terrain mesh is scaled to a 12 km arena with reduced
+vertical relief. Its triangles form a CPU BVH for collision and radar occlusion;
+this is not a heightfield. Aircraft collision uses forgiving sphere proxies.
+Projectiles sweep segments to avoid tunneling. `rocket.glb` is reused as 72 tree
+and rock placeholders with shared geometry and simple collision proxies.
+Projectile and explosion counts are bounded. Consecutive objects sharing a mesh
+are submitted as one instanced draw; terrain, cover, and aircraft normally need
+three world draws, plus projectile/effect batches and one UI draw. Procedural
+audio streams tones without decoding or retaining audio clips.
 
 ## Object loading and submission
 
@@ -82,7 +173,7 @@ decoder can produce `MeshData` (position/normal vertices and `u32` indices) and
 call `Renderer::upload_mesh(label, data)` without changing the forward pipeline.
 This version expects embedded GLB geometry buffers and rejects skins, morph
 targets, line/point primitives, and invalid geometry with errors. Animation and
-texture decoding are not implemented.
+texture decoding for 3D materials are not implemented. UI PNG decoding is separate.
 
 ## Source layout
 
@@ -90,6 +181,11 @@ texture decoding are not implemented.
 src/
   main.rs                       Command-line options and logging
   app.rs                        Window events and startup mesh selection
+  ui.rs                         Screens, widgets, navigation, mock session events
+  flight.rs                     Rigid body, force model, four control schemes
+  terrain.rs                    Static triangle BVH and collision queries
+  game.rs                       Local opponents, radar, combat, world submission
+  audio.rs                      Procedural lock / incoming-missile cues
   lib.rs                        Engine entry modules
   rendering/
     mod.rs                      Renderer, scene ownership, load/upload API
@@ -99,14 +195,18 @@ src/
     blinn_phong.wgsl            Universal vertex and fragment shader
     frame.rs                    CPU frame timing
     shadow_bake.rs              Reserved one-time level preprocessing
+    ui_gpu.rs                   Cached atlas and batched unlit UI rendering
+    ui.wgsl                     Screen-space overlay shader
 tests/
   forward_gpu.rs                GPU readback and depth/caching verification
+  ui_gpu.rs                     All-screen visual previews and keyboard route
 assets/                         Supplied models, images, and audio
 ```
 
 There are no separate jet, terrain, or ground-cover renderer modules. Future
 specialized optimizations can use the shared mesh path until measurements justify
-a different approach. Dynamic combat effects remain future work.
+a different approach. Current combat visuals use shared bullet/missile meshes and
+small placeholder explosion instances; a richer particle system remains future work.
 
 ## Verification
 
@@ -115,6 +215,7 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo test --test forward_gpu -- --ignored --nocapture
+cargo test --test ui_gpu -- --ignored --nocapture
 ```
 
 The explicit GPU test loads all four supplied GLBs, confirms cached mesh handles,
@@ -124,14 +225,28 @@ submission orders. It writes inspectable PNG previews to
 `target/render-previews/`. The GPU test is ignored by the default test command
 because it requires a graphics adapter.
 
+CPU UI tests cover keyboard navigation, scaled mouse clicks, disabled actions,
+settings, text editing, host cancellation, pause/resume, and global disconnection.
+The UI GPU test exercises all eleven screens through keyboard actions, checks
+their rendering, and writes PNG previews to `target/ui-previews/`. Both native
+startup and direct gameplay modes have three-frame smoke tests. Input behavior
+is covered by deterministic controller tests.
+
+Physics/combat tests cover neutral flight, maneuver stability, control signs,
+fixed-step behavior, collision sweeps, damage/ammo/respawn, radar visibility and
+warnings, cooldowns, independent missile guidance, and bounded audio samples.
+The UI GPU suite also renders a live flight scene and radar/missile warning scene.
+
 ## Remaining design work
 
 Terrain shadow volumes remain a one-time baking task. The forward shader does
-not apply baked shadows yet. Aircraft shadows, combat effects, asset streaming,
-UI, and gameplay still need implementation. Clouds are outside immediate scope.
+not apply baked shadows yet. Aircraft shadows, textured/per-object materials,
+richer effects, asset streaming, recorded sound effects/music, real networking,
+and further gameplay tuning remain. Clouds are outside immediate scope.
 
-Presentation uses `AutoNoVsync` with the backend's supported fallback and has no
-FPS limiter yet. The working goals remain 2K at 120 FPS and approximately 512 MB
+Presentation defaults to `AutoNoVsync` with the backend's supported fallback;
+VSync is selectable in Settings. Gameplay is paced toward 120 redraws per second.
+The working goals remain 2K at 120 FPS and approximately 512 MB
 to 1 GB of memory. The current tests verify correctness; they do not demonstrate
 those performance targets. Exact benchmark resolution and memory accounting
 remain to be settled.

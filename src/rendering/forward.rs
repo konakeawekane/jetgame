@@ -48,7 +48,7 @@ impl Camera {
         self.far = distance + radius * 4.0;
     }
 
-    fn view_projection(self, aspect: f32) -> Result<Mat4, SceneError> {
+    pub fn view_projection(self, aspect: f32) -> Result<Mat4, SceneError> {
         if !self.eye.is_finite()
             || !self.target.is_finite()
             || !self.up.is_finite()
@@ -124,12 +124,24 @@ impl RenderObject {
     }
 }
 
-#[derive(Default)]
 pub struct Scene {
     pub objects: Vec<RenderObject>,
     pub camera: Camera,
     pub material: SurfaceMaterial,
     pub light: DirectionalLight,
+    pub background: [f64; 4],
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            objects: Vec::new(),
+            camera: Camera::default(),
+            material: SurfaceMaterial::default(),
+            light: DirectionalLight::default(),
+            background: [0.025, 0.035, 0.055, 1.],
+        }
+    }
 }
 
 #[repr(C)]
@@ -334,7 +346,10 @@ impl ForwardPipeline {
         }
         if requested > self.object_capacity {
             // Grow only when necessary. Mesh buffers themselves are never reuploaded.
-            self.object_capacity = requested;
+            self.object_capacity = requested.next_power_of_two().min(
+                (device.limits().max_buffer_size / std::mem::size_of::<ObjectUniform>() as u64)
+                    as usize,
+            );
             self.objects = object_buffer(device, self.object_capacity);
         }
         if !self.staging.is_empty() {
@@ -372,13 +387,20 @@ impl ForwardPipeline {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(1, self.objects.slice(..));
-        for (instance, object) in scene.objects.iter().enumerate() {
+        let mut instance = 0;
+        while instance < scene.objects.len() {
+            let object = &scene.objects[instance];
+            let mut end = instance + 1;
+            while end < scene.objects.len() && scene.objects[end].mesh == object.mesh {
+                end += 1;
+            }
             let mesh = meshes
                 .get(object.mesh)
                 .expect("prepare validates mesh handles");
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, instance as u32..instance as u32 + 1);
+            pass.draw_indexed(0..mesh.index_count, 0, instance as u32..end as u32);
+            instance = end;
         }
     }
 }

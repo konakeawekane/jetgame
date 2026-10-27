@@ -87,6 +87,20 @@ impl GpuContext {
         self.size
     }
 
+    pub fn set_vsync(&mut self, enabled: bool) {
+        let mode = if enabled {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        if self.config.present_mode != mode {
+            self.config.present_mode = mode;
+            if self.size.width > 0 && self.size.height > 0 {
+                self.surface.configure(&self.device, &self.config);
+            }
+        }
+    }
+
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         self.size = size;
         // Minimized windows have no renderable surface.
