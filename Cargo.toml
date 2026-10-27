@@ -1,0 +1,19 @@
+[package]
+name = "jetgame"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+wgpu = "0.19"
+winit = "0.29"
+bytemuck = { version = "1.14", features = ["derive"] }
+pollster = "0.3"
+log = "0.4"
+env_logger = "0.10"
+glam = "0.27"
+gltf = { version = "1.4", default-features = false, features = ["utils"] }
+thiserror = "1"
+
+[dev-dependencies]
+png = "0.17"
