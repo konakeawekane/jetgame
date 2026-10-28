@@ -2,6 +2,8 @@
 
 pub mod app;
 pub mod audio;
+mod clipboard;
+pub mod config;
 pub mod flight;
 pub mod game;
 pub mod networking;

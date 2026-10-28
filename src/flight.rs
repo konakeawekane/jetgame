@@ -4,7 +4,8 @@ use glam::{Mat3, Quat, Vec2, Vec3};
 
 pub const FIXED_DT: f32 = 1. / 120.;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FlightTuning {
     pub mass: f32,
     pub inertia: Vec3,

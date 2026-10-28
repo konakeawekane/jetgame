@@ -1,8 +1,8 @@
 # JetGame
 
 Rust engine for a low-poly multiplayer jet dogfighting game, using `wgpu 0.19`
-and `winit 0.29`. Native Rust clients connect to a server-only Python networking
-scaffold. See [networking setup and packaging](networking/README.md).
+and `winit 0.29`. Rust owns the game/UI; a separate Python process owns networking.
+See [networking setup and packaging](networking/README.md) and [source organization](architecture.md).
 
 ## Current rendering path
 
@@ -46,6 +46,13 @@ cargo run -- --preview --smoke-test
 directly. `--smoke-test` exits successfully after three presented frames.
 These options can be combined. `--help` lists them.
 
+`game.json` configures assets, window/frame rates, physics rate, flight tuning,
+bot count, weapons, radar, and match rules. `game.local.json` overrides it locally;
+`--config FILE.json` selects another file. `networking.json` configures the Python
+runtime, listen addresses/ports, LAN discovery, connection limits/timeouts, and
+advertised external addresses. Its local override is `networking.local.json`.
+Normal network play needs Python 3.11+; offline preview does not start Python.
+
 ## User interface
 
 All eleven screens from `UserInterface.md` are implemented: splash, start,
@@ -61,8 +68,15 @@ back to plain panels. An original bitmap font supplies placeholder text.
 - Host name: Enter/click to edit, type ASCII text, Backspace to erase, Enter to finish.
 - Settings opened from pause return to pause. Local gameplay pauses while menus are open.
 
-The default browser uses real directory listings when a directory is configured.
-Hosting launches the headless Python server; joining uses native Rust networking.
+The default browser discovers hosts on the LAN. Hosting and joining run through
+the Python network service; there is no central directory or relay dependency.
+Hosts automatically receive a `jetgame://` join link when they create a lobby.
+Copy Join Link copies it; hosts never need to type a link or address. Paste it into the browser
+and select Connect, or pass it with `--connect`. On Windows Ctrl+V pastes and
+Ctrl+C in a hosting lobby copies the invitation. Its label distinguishes Internet
+address candidates, the same LAN, and this computer only. Advanced forwarded IPv4
+addresses can still be supplied through networking configuration or the CLI.
+Connections attempt IPv6 before IPv4. Router/firewall reachability is still required.
 Lobbies synchronize participants and Ready state. Network match start deliberately
 reports that gameplay synchronization is not implemented yet. Use `--offline`
 for the original mock joining flow and local bot matches, or `--preview` to fly
@@ -191,12 +205,15 @@ texture decoding for 3D materials are not implemented. UI PNG decoding is separa
 src/
   main.rs                       Command-line options and logging
   app.rs                        Window events and startup mesh selection
-  ui.rs                         Screens, widgets, navigation, mock session events
+  ui.rs                         Screens, widgets, navigation, session events
+  config.rs                     Game configuration and validation
   flight.rs                     Rigid body, force model, four control schemes
   terrain.rs                    Static triangle BVH and collision queries
-  game.rs                       Local opponents, radar, combat, world submission
+  game.rs                       Fixed simulation ticks, bots, radar, combat
+  game/presentation.rs          Mesh instances, camera, HUD projection
   audio.rs                      Procedural lock / incoming-missile cues
   lib.rs                        Engine entry modules
+  networking/                   Python launcher and typed local pipe interface
   rendering/
     mod.rs                      Renderer, scene ownership, load/upload API
     context.rs                  Device, queue, surface, resize, depth target
@@ -210,6 +227,10 @@ src/
 tests/
   forward_gpu.rs                GPU readback and depth/caching verification
   ui_gpu.rs                     All-screen visual previews and keyboard route
+  networking.rs                 Rust/Python command/event integration
+networking/                     Python discovery, invitations, lobby and transports
+game.json                       Editable game/assets/physics/match policy
+networking.json                 Python runtime and network policy
 assets/                         Supplied models, images, and audio
 ```
 
@@ -226,6 +247,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo test --test forward_gpu -- --ignored --nocapture
 cargo test --test ui_gpu -- --ignored --nocapture
+cargo test --test networking -- --ignored --nocapture
+python -m unittest discover -s networking/tests -v
 ```
 
 The explicit GPU test loads all four supplied GLBs, confirms cached mesh handles,

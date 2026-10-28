@@ -1,0 +1,47 @@
+{
+  "title": "JetGame",
+  "window": [1280, 720],
+  "gameplay_fps": 120,
+  "menu_fps": 30,
+  "assets": {
+    "root": "assets",
+    "aircraft": "f-16_fighter_jet.glb",
+    "terrain": "world_01.glb",
+    "missile": "rocket.glb",
+    "bullet": "bullet.glb",
+    "terrain_width": 12000.0,
+    "terrain_height_scale": 0.22
+  },
+  "rules": {
+    "physics_hz": 120,
+    "bot_count": 3,
+    "round_seconds": 180.0,
+    "kill_limit": 5,
+    "max_projectiles": 256,
+    "cover_count": 72,
+    "cover_seed": 12345,
+    "health": 100.0,
+    "gun_ammo": 800,
+    "missiles": 8,
+    "gun_hz": 12.0,
+    "bot_gun_hz": 2.5,
+    "missile_cooldown": 0.9,
+    "gun_damage": 18.0,
+    "missile_damage": 75.0,
+    "radar_range": 2800.0,
+    "radar_acquire_seconds": 1.25,
+    "radar_acquire_degrees": 30.0,
+    "radar_hold_degrees": 45.0,
+    "respawn_seconds": 5.0,
+    "spawn_protection_seconds": 2.0
+  },
+  "flight": {
+    "mass": 9000.0,
+    "inertia": [35000.0, 65000.0, 90000.0],
+    "wing_area": 28.0,
+    "thrust": 32000.0,
+    "angular_response": 5.0,
+    "side_damping": 1.5,
+    "max_rates": [0.85, 0.55, 1.9]
+  }
+}

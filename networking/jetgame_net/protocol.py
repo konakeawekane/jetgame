@@ -28,10 +28,12 @@ async def receive(reader, timeout=10):
         try:
             message = json.loads((await reader.readexactly(length)).decode("utf-8"),
                                  parse_constant=lambda _: (_ for _ in ()).throw(ProtocolError("nonfinite JSON")))
-        except (UnicodeError, json.JSONDecodeError) as error:
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
             raise ProtocolError("invalid JSON") from error
         if not isinstance(message, dict) or type(message.get("version")) is not int or message.get("version") != VERSION:
             raise ProtocolError("incompatible protocol version")
+        if set(message) != {"version", "kind", "request_id", "payload"}:
+            raise ProtocolError("invalid message fields")
         if not isinstance(message.get("kind"), str) or not 1 <= len(message["kind"]) <= 40 or not isinstance(message.get("payload"), dict):
             raise ProtocolError("invalid message envelope")
         if type(message.get("request_id")) is not int or not 0 <= message["request_id"] < 2**64:
@@ -43,20 +45,6 @@ async def receive(reader, timeout=10):
 async def send(writer, kind, payload=None, request_id=0):
     writer.write(encode(kind, payload, request_id))
     await asyncio.wait_for(writer.drain(), 2)
-
-
-async def request(endpoint, kind, payload=None):
-    host, port = endpoint.rsplit(":", 1)
-    reader, writer = await asyncio.wait_for(asyncio.open_connection(host.strip("[]"), int(port)), 2)
-    try:
-        await send(writer, kind, payload, 1)
-        result = await receive(reader, 2)
-        if result["kind"] == "error":
-            raise ProtocolError(result["payload"].get("message", "request failed"))
-        return result["payload"]
-    finally:
-        writer.close()
-        await writer.wait_closed()
 
 
 def clean_text(value, default, limit=32):

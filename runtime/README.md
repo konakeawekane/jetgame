@@ -1,25 +1,21 @@
-# Hosting runtime contract
+# Python runtime
 
-Python is server-only: the Rust client discovers/joins lobbies without invoking
-Python. Every distributable should nevertheless include a private interpreter
-because every copy may host a match.
+Each network-enabled game copy needs a private Python 3.11+ interpreter. Python
+owns discovery, joining, and hosting; Rust owns simulation, rendering, and the UI.
+Offline bot preview does not start Python.
 
-On Windows the packaging script expects an extracted x64 CPython embeddable
-distribution (3.11+), copied to `runtime/python/`. Keep the interpreter, standard
-library ZIP, DLLs, restricted `._pth` file, and licenses together. The hosting
-server uses only the standard library; pip and a global Python installation are
-not required. No runtime download happens on game startup.
+On Windows `scripts/package.ps1` accepts an extracted x64 CPython embeddable
+distribution and copies it to `runtime/python/`. Keep its standard-library ZIP,
+DLLs, restricted `._pth`, and licenses together. No pip packages or startup runtime
+downloads are required. Both Python entry points add their own source directory
+to the restricted import path explicitly.
 
-For development, debug builds may use `python` / `python3` from PATH. Override
-with `--server-python ABSOLUTE_PATH` or `JETGAME_SERVER_PYTHON`. Release builds
-require a bundled or explicitly configured hosting interpreter. Ordinary clients
-still work when no Python interpreter exists.
+Debug builds may use Python on PATH. Override with `--python ABSOLUTE_PATH`,
+`JETGAME_PYTHON`, or `python` in `networking.local.json`. Release networking
+requires the bundled or explicitly configured interpreter. The runtime process
+is hidden on Windows and communicates with Rust over owned pipes. Closing the
+app closes its stdin and triggers cleanup; an unresponsive owned process is
+terminated. Other Python processes are never targeted.
 
-The game starts its owned server without a console window, reads one bounded
-readiness message, and retains a parent-lifetime pipe. Leaving or closing the app
-closes that pipe; the server unregisters and exits. The worker also terminates
-an unresponsive owned process. Other Python processes are never targeted.
-
-This repository intentionally does not vendor a Python binary yet. Use
-`scripts/package.ps1` with a supplied embeddable runtime and shared directory
-endpoint; its bundle contract prevents accidentally shipping a client-only build.
+This repository does not contain the interpreter binary. Packaging needs a
+supplied runtime, and no public server, directory endpoint, or relay.

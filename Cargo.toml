@@ -11,10 +11,13 @@ bytemuck = { version = "1.14", features = ["derive"] }
 pollster = "0.3"
 log = "0.4"
 env_logger = "0.10"
-glam = "0.27"
+glam = { version = "0.27", features = ["serde"] }
 gltf = { version = "1.4", default-features = false, features = ["utils"] }
 thiserror = "1"
 png = "0.17"
 cpal = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_DataExchange", "Win32_System_Memory", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

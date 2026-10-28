@@ -1,5 +1,6 @@
 use crate::{
     audio::RadarAudio,
+    config::GameConfig,
     flight::{FlightInput, FlightKey},
     game::{GameAssets, aim_direction, chase_camera},
     networking::{NetworkClient, NetworkConfig},
@@ -17,7 +18,7 @@ use winit::{
     dpi::PhysicalSize,
     event::{DeviceEvent, ElementState, Event, Ime, MouseButton, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{CursorGrabMode, WindowBuilder},
 };
 
@@ -28,6 +29,7 @@ pub struct RunOptions {
     pub offline: bool,
     pub network: NetworkConfig,
     pub connect: Option<String>,
+    pub game: GameConfig,
 }
 impl Default for RunOptions {
     fn default() -> Self {
@@ -38,6 +40,7 @@ impl Default for RunOptions {
             offline: false,
             network: NetworkConfig::default(),
             connect: None,
+            game: GameConfig::default(),
         }
     }
 }
@@ -46,12 +49,20 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title("JetGame")
-            .with_inner_size(PhysicalSize::new(1280, 720))
+            .with_title(&options.game.title)
+            .with_inner_size(PhysicalSize::new(
+                options.game.window[0],
+                options.game.window[1],
+            ))
             .build(&event_loop)?,
     );
-    let mut renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))?;
-    let (assets, mut world) = GameAssets::load(&mut renderer, &options.mesh)?;
+    let mut renderer = pollster::block_on(Renderer::new_with_assets(
+        Arc::clone(&window),
+        &options.game.assets.root,
+    ))?;
+    let (device, meshes) = renderer.mesh_resources();
+    let (assets, mut world) =
+        GameAssets::load_configured_on(device, meshes, &options.mesh, &options.game)?;
     assets.preview_scene(&mut renderer.scene);
     let audio = RadarAudio::new();
     let mut input = FlightInput::default();
@@ -84,6 +95,7 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let mut ime_allowed = false;
     let mut captured = false;
     let mut fatal_error = None;
+    let mut modifiers = ModifiersState::empty();
 
     event_loop.run(|event, target| {
         target.set_control_flow(ControlFlow::WaitUntil(next_tick));
@@ -132,9 +144,20 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                         ui.pointer_button(state == ElementState::Pressed);
                     }
                 }
+                WindowEvent::ModifiersChanged(value) => modifiers = value.state(),
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
-                        if event.state == ElementState::Released {
+                        if event.state == ElementState::Pressed
+                            && !ui.is_gameplay()
+                            && modifiers.control_key()
+                            && matches!(code, KeyCode::KeyV | KeyCode::KeyC)
+                        {
+                            if code == KeyCode::KeyV {
+                                ui.request_paste();
+                            } else {
+                                ui.copy_invitation();
+                            }
+                        } else if event.state == ElementState::Released {
                             if let Some(key) = flight_key(code) {
                                 input.set(key, false);
                             }
@@ -278,9 +301,9 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                     }
                     next_tick = now
                         + Duration::from_secs_f64(if ui.is_gameplay() {
-                            1. / 120.
+                            1. / options.game.gameplay_fps as f64
                         } else {
-                            1. / 30.
+                            1. / options.game.menu_fps as f64
                         });
                     target.set_control_flow(ControlFlow::WaitUntil(next_tick));
                 }
@@ -295,6 +318,18 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                 if let Err(error) = client.submit(request) {
                     ui.network_request_failed(error);
                 }
+            }
+        }
+        if ui.take_paste_request() {
+            match crate::clipboard::read() {
+                Ok(text) => ui.paste_text(&text),
+                Err(error) => ui.clipboard_result(&error.to_string()),
+            }
+        }
+        if let Some(text) = ui.take_copy_text() {
+            match crate::clipboard::write(&text) {
+                Ok(()) => ui.clipboard_result("INVITATION COPIED"),
+                Err(error) => ui.clipboard_result(&error.to_string()),
             }
         }
         let screen = ui.screen();

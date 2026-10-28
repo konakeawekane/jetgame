@@ -1,8 +1,21 @@
 {
-  "directory": null,
   "python": null,
-  "server_script": "networking/server_main.py",
-  "host_bind": "0.0.0.0",
+  "agent_script": "networking/agent_main.py",
   "host_port": 29010,
-  "public_port": null
+  "listen_ipv6": "::",
+  "listen_ipv4": "0.0.0.0",
+  "lan_enabled": true,
+  "discovery_port": 29009,
+  "discovery_group": "239.255.42.99",
+  "discovery_interface": "0.0.0.0",
+  "discovery_seconds": 1.2,
+  "connect_timeout": 2.0,
+  "handshake_timeout": 3.0,
+  "idle_timeout": 10.0,
+  "ping_seconds": 2.0,
+  "max_connections": 64,
+  "max_players": 32,
+  "max_listings": 64,
+  "public_addresses": [],
+  "player_name": "PILOT"
 }

@@ -1,1 +1,1 @@
-"""Headless server/control-plane scaffold. Python is never a client dependency."""
+"""Python network service: LAN discovery, invitations, clients, and headless hosts."""

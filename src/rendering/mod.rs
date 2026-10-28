@@ -37,14 +37,15 @@ pub struct Renderer {
 
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_assets(window, Path::new("assets")).await
+    }
+    pub async fn new_with_assets(
+        window: Arc<Window>,
+        asset_root: &Path,
+    ) -> Result<Self, Box<dyn Error>> {
         let gpu = GpuContext::new(window).await?;
         let forward = ForwardPipeline::new(&gpu.device, gpu.color_format());
-        let overlay = UiRenderer::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.color_format(),
-            Path::new("assets"),
-        );
+        let overlay = UiRenderer::new(&gpu.device, &gpu.queue, gpu.color_format(), asset_root);
         Ok(Self {
             gpu,
             meshes: MeshAssets::default(),

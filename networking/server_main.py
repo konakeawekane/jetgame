@@ -1,61 +1,61 @@
-"""Isolated entry point for standalone and game-launched headless servers."""
+"""Standalone headless host using the same server/config as the game-launched agent."""
 
 import argparse
 import asyncio
 import json
-import logging
 from pathlib import Path
 import sys
 import threading
 
-# Also works with Python -I and a minimal embeddable runtime's restricted search path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from jetgame_net.directory import Directory
+from jetgame_net.config import load
 from jetgame_net.server import MatchServer
 
 
 async def run(args):
+    settings = load(args.config)
+    updates = {}
+    if args.port is not None:
+        updates["host_port"] = args.port
+    if args.no_lan:
+        updates["lan_enabled"] = False
+    if args.public_address:
+        updates["public_addresses"] = args.public_address
+    from dataclasses import asdict
+    settings = type(settings).parse({**asdict(settings), **updates})
+    server = MatchServer(args.name, args.max_players, args.map, args.mode, settings)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
     if args.parent_stdin:
-        def parent_watch():
+        def watch():
             while sys.stdin.buffer.read(1):
                 pass
             if not loop.is_closed():
                 loop.call_soon_threadsafe(stopped.set)
-        threading.Thread(target=parent_watch, daemon=True).start()
-    service = Directory() if args.service == "directory" else MatchServer(
-        args.name, args.max_players, args.map, args.mode, args.directory, args.public_port)
+        threading.Thread(target=watch, daemon=True).start()
     try:
-        port = await service.start(args.bind, args.port)
-        ready = {"kind": "ready", "port": port}
-        if isinstance(service, MatchServer):
-            ready["admin_token"] = service.admin_token
-        # stdout is only the parent bootstrap channel; never write the token to logs.
-        print(json.dumps(ready), flush=True)
+        await server.start()
+        link, scope = await server.invitation()
+        print(json.dumps({"kind": "ready", "port": server.port, "endpoint": server.local_endpoint,
+                          "link": link, "scope": scope, "warning": server.discovery_warning}), flush=True)
         await stopped.wait()
     finally:
-        await service.close()
+        await server.close()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--service", choices=["match", "directory"], default="match")
-    parser.add_argument("--bind", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=0)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config")
+    parser.add_argument("--port", type=int)
     parser.add_argument("--name", default="DOGFIGHT")
-    parser.add_argument("--max-players", type=int, choices=range(2, 33), default=8)
+    parser.add_argument("--max-players", type=int, default=8)
     parser.add_argument("--map", default="WORLD 01")
     parser.add_argument("--mode", default="TEAM DOGFIGHT")
-    parser.add_argument("--directory")
-    parser.add_argument("--public-port", type=int)
+    parser.add_argument("--public-address", action="append")
+    parser.add_argument("--no-lan", action="store_true")
     parser.add_argument("--parent-stdin", action="store_true")
-    args = parser.parse_args()
-    if not 0 <= args.port <= 65535 or (args.public_port is not None and not 1 <= args.public_port <= 65535):
-        parser.error("invalid port")
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     try:
-        asyncio.run(run(args))
+        asyncio.run(run(parser.parse_args()))
     except KeyboardInterrupt:
         pass
 

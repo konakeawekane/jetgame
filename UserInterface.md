@@ -45,7 +45,7 @@
 * Arrow keys navigate menus and adjust values; Enter activates the focused control like a left click.
 * P opens the in-game pause menu and resumes from it. Escape navigates back.
 * Settings opened from the pause menu return to that pause menu.
-* Normal startup uses the native network client for discovery, joining, and live lobby rosters. A configured directory supplies listings; Host starts a Python server.
+* Normal startup uses a Python network service for LAN discovery, joining, and live lobby rosters. Host creates a headless server in that service.
 * `--offline` retains the mock joining sequence leading to the waiting lobby or directly to spawn for an active match.
 * Pause-menu preview actions exercise respawning, match completion, and connection loss without a network backend.
 
@@ -58,6 +58,7 @@
 
 ## Networking scaffold
 
-* Joining does not depend on Python. Packaged hosts run their bundled Python interpreter as a separate headless server process.
+* Network operations use a separate bundled Python runtime. Rust exchanges local commands/events over owned pipes. Offline gameplay does not start Python.
 * Canceling a join or leaving a hosted lobby closes the owned session/server. Stale connection events cannot reopen canceled screens.
-* Directory registration and discovery are implemented, but Internet deployment, NAT traversal/relay, and production security are pending. See [networking/README.md](networking/README.md).
+* The browser includes an address/invitation field, Paste, and Connect. Hosting generates a join link automatically, with no host address-entry field. Copy Join Link in the lobby copies it; a scope label identifies Internet address candidates, the same LAN, or this computer only. Windows supports Ctrl+V and Ctrl+C.
+* LAN discovery needs no directory. Invitation joining tries IPv6 first and IPv4 second. External firewall access or manual IPv4 forwarding may be necessary; no relay or router changes are made. See [networking/README.md](networking/README.md).

@@ -1,7 +1,7 @@
 //! Small screen controller and retained display list. No game/network state lives in widgets.
 
 use crate::networking::{
-    HostOptions, NetworkEvent, PeerInfo, Request as NetworkRequest, ServerListing,
+    HostOptions, LinkScope, NetworkEvent, PeerInfo, Request as NetworkRequest, ServerListing,
 };
 use std::{collections::VecDeque, time::Duration};
 
@@ -205,6 +205,10 @@ enum Action {
     PreviousPage,
     NextPage,
     Join,
+    JoinAddress,
+    ConnectAddress,
+    PasteAddress,
+    CopyLink,
     Host,
     HostName,
     Mode,
@@ -307,6 +311,12 @@ pub struct UiController {
     network_roster: Vec<PeerInfo>,
     local_player: u64,
     network_endpoint: String,
+    join_address: String,
+    share_link: String,
+    share_scope: LinkScope,
+    edit_target: Action,
+    copy_text: Option<String>,
+    paste_requested: bool,
 }
 
 impl Default for UiController {
@@ -341,6 +351,12 @@ impl Default for UiController {
             network_roster: Vec::new(),
             local_player: 0,
             network_endpoint: String::new(),
+            join_address: String::new(),
+            share_link: String::new(),
+            share_scope: LinkScope::Local,
+            edit_target: Action::HostName,
+            copy_text: None,
+            paste_requested: false,
         }
     }
 }
@@ -353,13 +369,50 @@ impl UiController {
     pub fn take_network_requests(&mut self) -> VecDeque<NetworkRequest> {
         std::mem::take(&mut self.network_requests)
     }
+    pub fn request_paste(&mut self) {
+        if self.network_enabled && (self.screen == Screen::ServerBrowser || self.editing) {
+            self.paste_requested = true;
+        }
+    }
+    pub fn take_paste_request(&mut self) -> bool {
+        std::mem::take(&mut self.paste_requested)
+    }
+    pub fn take_copy_text(&mut self) -> Option<String> {
+        self.copy_text.take()
+    }
+    pub fn copy_invitation(&mut self) {
+        if !self.share_link.is_empty() && self.screen == Screen::Lobby {
+            self.copy_text = Some(self.share_link.clone());
+        }
+    }
+    pub fn clipboard_result(&mut self, message: &str) {
+        self.message = message.into();
+        self.dirty = true;
+    }
+    pub fn paste_text(&mut self, text: &str) {
+        if self.screen == Screen::ServerBrowser {
+            self.join_address = text
+                .trim()
+                .chars()
+                .filter(|c| c.is_ascii_graphic())
+                .take(4096)
+                .collect();
+        } else if self.editing {
+            match self.edit_target {
+                Action::HostName => self.host_name.clear(),
+                _ => return,
+            }
+            self.text(text.trim());
+        }
+        self.dirty = true;
+    }
     fn operation(&mut self) -> u64 {
         self.network_operation = self.network_operation.wrapping_add(1);
         self.network_operation
     }
     fn discover(&mut self) {
         let op = self.operation();
-        self.message = "SEARCHING FOR MATCHES...".into();
+        self.message = "SEARCHING LAN...".into();
         self.network_requests
             .push_back(NetworkRequest::Discover { op });
         self.dirty = true;
@@ -368,7 +421,7 @@ impl UiController {
         self.network_enabled = true;
         let op = self.operation();
         self.session = Some(Session {
-            name: endpoint.clone(),
+            name: "CONNECTING".into(),
             ..Default::default()
         });
         self.network_requests
@@ -426,6 +479,19 @@ impl UiController {
                 self.network_roster = players;
                 self.dirty = true;
             }
+            NetworkEvent::ShareLink {
+                op,
+                link,
+                scope,
+                warning,
+            } if op == self.network_operation && self.screen == Screen::Lobby => {
+                self.share_link = link;
+                self.share_scope = scope;
+                if !warning.is_empty() {
+                    self.message = warning.to_uppercase();
+                }
+                self.dirty = true;
+            }
             NetworkEvent::Error { op, message } if op == self.network_operation => {
                 if self.screen == Screen::Joining {
                     self.leave();
@@ -436,13 +502,11 @@ impl UiController {
             NetworkEvent::Disconnected { op, reason } if op == self.network_operation => {
                 self.session_event(SessionEvent::ConnectionLost(reason))
             }
-            NetworkEvent::WorkerStopped => {
+            NetworkEvent::WorkerStopped { reason } => {
                 if self.session.is_some() {
-                    self.session_event(SessionEvent::ConnectionLost(
-                        "NETWORK SERVICE STOPPED".into(),
-                    ));
+                    self.session_event(SessionEvent::ConnectionLost(reason));
                 } else {
-                    self.message = "NETWORK SERVICE STOPPED".into();
+                    self.message = reason.to_uppercase();
                     self.dirty = true;
                 }
             }
@@ -466,8 +530,8 @@ impl UiController {
                             if s.in_progress { "IN MATCH" } else { "LOBBY" },
                             s.players,
                             s.max_players,
-                            if s.reachability == "verified" {
-                                "DIRECT"
+                            if s.reachability == "LAN" {
+                                "LAN"
                             } else {
                                 "UNVERIFIED"
                             }
@@ -557,6 +621,7 @@ impl UiController {
                     self.operation();
                     self.network_requests.push_back(NetworkRequest::Leave);
                     self.network_roster.clear();
+                    self.share_link.clear();
                 }
                 self.session = None;
                 self.message = format!("CONNECTION LOST: {}", reason.to_uppercase());
@@ -623,7 +688,15 @@ impl UiController {
             }
             UiKey::Back => self.back(),
             UiKey::Backspace if self.editing => {
-                self.host_name.pop();
+                match self.edit_target {
+                    Action::HostName => {
+                        self.host_name.pop();
+                    }
+                    Action::JoinAddress => {
+                        self.join_address.pop();
+                    }
+                    _ => {}
+                }
                 self.dirty = true;
             }
             _ => {}
@@ -632,12 +705,17 @@ impl UiController {
     }
 
     pub fn text(&mut self, text: &str) {
-        if self.editing && self.screen == Screen::Host {
+        if self.editing {
+            let (buffer, limit, uppercase) = match self.edit_target {
+                Action::HostName => (&mut self.host_name, 24, true),
+                Action::JoinAddress => (&mut self.join_address, 4096, false),
+                _ => return,
+            };
             for c in text.chars().filter(|c| c.is_ascii_graphic() || *c == ' ') {
-                if self.host_name.len() >= 24 {
+                if buffer.len() >= limit {
                     break;
                 }
-                self.host_name.push(c.to_ascii_uppercase());
+                buffer.push(if uppercase { c.to_ascii_uppercase() } else { c });
             }
             self.dirty = true;
         }
@@ -716,9 +794,14 @@ impl UiController {
             self.operation();
             self.network_requests.push_back(NetworkRequest::Leave);
             self.network_roster.clear();
+            self.share_link.clear();
         }
         self.session = None;
-        self.message = "OFFLINE PREVIEW / NO NETWORK CONNECTION".into();
+        self.message = if self.network_enabled {
+            String::new()
+        } else {
+            "OFFLINE PREVIEW / NO NETWORK CONNECTION".into()
+        };
         self.go(Screen::ServerBrowser);
     }
 
@@ -810,10 +893,18 @@ impl UiController {
                 self.go(Screen::Joining);
             }
             Action::Host => self.go(Screen::Host),
-            Action::HostName => {
+            Action::HostName | Action::JoinAddress => {
+                self.edit_target = action;
                 self.editing = !self.editing;
                 self.dirty = true;
             }
+            Action::ConnectAddress => {
+                if !self.join_address.trim().is_empty() {
+                    self.connect_direct(self.join_address.trim().into());
+                }
+            }
+            Action::PasteAddress => self.request_paste(),
+            Action::CopyLink => self.copy_invitation(),
             Action::Create => {
                 let name = if self.host_name.trim().is_empty() {
                     "LOCAL DOGFIGHT"
@@ -993,7 +1084,7 @@ impl UiController {
                 paint.header(
                     "SERVER BROWSER",
                     if self.network_enabled {
-                        "SELECT A SERVER, THEN JOIN"
+                        "LAN MATCHES / OR JOIN WITH AN INVITATION"
                     } else {
                         "OFFLINE PREVIEW  /  SELECT A SERVER, THEN JOIN"
                     },
@@ -1014,6 +1105,40 @@ impl UiController {
                 if self.network_enabled && self.server_list.len() > 3 {
                     paint.button(Rect::new(1010., 170., 80., 30.), "<", Action::PreviousPage);
                     paint.button(Rect::new(1110., 170., 80., 30.), ">", Action::NextPage);
+                }
+                if self.network_enabled {
+                    let tail: String = self
+                        .join_address
+                        .chars()
+                        .rev()
+                        .take(65)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    paint.button(
+                        Rect::new(64., 454., 756., 44.),
+                        &format!(
+                            "ADDRESS: {tail}{}",
+                            if self.editing && self.edit_target == Action::JoinAddress {
+                                "_"
+                            } else {
+                                ""
+                            }
+                        ),
+                        Action::JoinAddress,
+                    );
+                    paint.button(
+                        Rect::new(838., 454., 174., 44.),
+                        "PASTE",
+                        Action::PasteAddress,
+                    );
+                    paint.enabled_button(
+                        Rect::new(1030., 454., 186., 44.),
+                        "CONNECT",
+                        Action::ConnectAddress,
+                        !self.join_address.trim().is_empty(),
+                    );
                 }
                 for (i, (label, action)) in [
                     ("REFRESH", Action::Refresh),
@@ -1068,7 +1193,11 @@ impl UiController {
                     },
                 );
                 paint.panel(Rect::new(260., 150., 760., 470.));
-                let cursor = if self.editing { "_" } else { "" };
+                let cursor = if self.editing && self.edit_target == Action::HostName {
+                    "_"
+                } else {
+                    ""
+                };
                 let labels = [
                     format!("NAME: {}{}", self.host_name, cursor),
                     format!("MODE: < {} >", MODES[self.host_mode]),
@@ -1081,18 +1210,15 @@ impl UiController {
                     },
                     "CANCEL".into(),
                 ];
-                for (i, (label, action)) in labels
-                    .iter()
-                    .zip([
-                        Action::HostName,
-                        Action::Mode,
-                        Action::Map,
-                        Action::MaxPlayers,
-                        Action::Create,
-                        Action::Back,
-                    ])
-                    .enumerate()
-                {
+                let actions = [
+                    Action::HostName,
+                    Action::Mode,
+                    Action::Map,
+                    Action::MaxPlayers,
+                    Action::Create,
+                    Action::Back,
+                ];
+                for (i, (label, action)) in labels.iter().zip(actions).enumerate() {
                     paint.button(
                         Rect::new(290., 178. + i as f32 * 66., 700., 48.),
                         label,
@@ -1101,7 +1227,7 @@ impl UiController {
                 }
                 paint.text(
                     [290., 634.],
-                    "NAME FIELD: ENTER TO EDIT  /  TYPE  /  BACKSPACE  /  ENTER TO FINISH",
+                    "ENTER TO EDIT / CTRL+V TO PASTE / ENTER TO FINISH",
                     1.2,
                     MUTED,
                 );
@@ -1203,6 +1329,23 @@ impl UiController {
                     Action::Leave,
                 );
                 if self.network_enabled {
+                    if !self.share_link.is_empty() {
+                        paint.text(
+                            [782., 438.],
+                            match self.share_scope {
+                                LinkScope::Internet => "LINK: INTERNET ADDRESS",
+                                LinkScope::Lan => "LINK: SAME NETWORK",
+                                LinkScope::Local => "LINK: THIS COMPUTER ONLY",
+                            },
+                            1.1,
+                            MUTED,
+                        );
+                        paint.button(
+                            Rect::new(782., 458., 400., 34.),
+                            "COPY JOIN LINK",
+                            Action::CopyLink,
+                        );
+                    }
                     paint.notice(&self.message);
                 }
             }
@@ -1569,6 +1712,46 @@ impl Painter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guests_can_paste_links_and_hosts_do_not_need_an_address() {
+        let mut ui = UiController::default();
+        ui.enable_networking();
+        ui.go(Screen::ServerBrowser);
+        let link = "jetgame://join?v=1&endpoint=Example.net%3A29010";
+        ui.paste_text(link);
+        select(&mut ui, Action::ConnectAddress);
+        assert!(
+            matches!(ui.network_requests.back(),Some(NetworkRequest::Join { endpoint,.. }) if endpoint==link)
+        );
+        ui.leave();
+        select(&mut ui, Action::Host);
+        ui.ensure_layout();
+        assert_eq!(ui.widgets.len(), 6);
+        select(&mut ui, Action::Create);
+        assert!(matches!(
+            ui.network_requests.back(),
+            Some(NetworkRequest::Host { .. })
+        ));
+    }
+
+    #[test]
+    fn invitation_copy_is_cleared_when_the_connection_is_lost() {
+        let mut ui = UiController::default();
+        ui.enable_networking();
+        ui.go(Screen::Lobby);
+        ui.network_event(NetworkEvent::ShareLink {
+            op: 0,
+            link: "jetgame://join?v=1&endpoint=localhost:29010".into(),
+            scope: LinkScope::Local,
+            warning: String::new(),
+        });
+        select(&mut ui, Action::CopyLink);
+        assert!(ui.take_copy_text().unwrap().starts_with("jetgame://"));
+        ui.session_event(SessionEvent::ConnectionLost("test".into()));
+        assert!(ui.share_link.is_empty());
+        assert_eq!(ui.screen(), Screen::ServerBrowser);
+    }
 
     const SCREENS: [Screen; 11] = [
         Screen::Splash,

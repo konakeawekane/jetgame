@@ -401,6 +401,19 @@ fn every_screen_renders_and_keyboard_route_remains_functional() {
         endpoint: "127.0.0.1:29010".into(),
     });
     assert_eq!(online.screen(), Screen::Lobby);
+    online.network_event(jetgame::networking::NetworkEvent::ShareLink {
+        op,
+        link: "jetgame://join?v=1&endpoint=127.0.0.1%3A29010".into(),
+        scope: jetgame::networking::LinkScope::Lan,
+        warning: String::new(),
+    });
     harness.capture(&mut online, &output, "17_online_lobby");
+    online.key(UiKey::Back);
+    online.key(UiKey::Down); // Paste
+    online.key(UiKey::Down); // Refresh (Connect and Join are disabled)
+    online.key(UiKey::Down); // Host
+    online.key(UiKey::Enter);
+    assert_eq!(online.screen(), Screen::Host);
+    harness.capture(&mut online, &output, "18_online_host");
     assert!(pollster::block_on(harness.device.pop_error_scope()).is_none());
 }
