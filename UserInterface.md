@@ -45,8 +45,8 @@
 * Arrow keys navigate menus and adjust values; Enter activates the focused control like a left click.
 * P opens the in-game pause menu and resumes from it. Escape navigates back.
 * Settings opened from the pause menu return to that pause menu.
-* The server list, joining sequence, lobby roster, results, and simulation-dependent HUD values use explicit offline placeholders.
-* A mock joining sequence can lead to the waiting lobby or directly to spawn for an active match.
+* Normal startup uses the native network client for discovery, joining, and live lobby rosters. A configured directory supplies listings; Host starts a Python server.
+* `--offline` retains the mock joining sequence leading to the waiting lobby or directly to spawn for an active match.
 * Pause-menu preview actions exercise respawning, match completion, and connection loss without a network backend.
 
 ## Local gameplay integration
@@ -54,4 +54,10 @@
 * Spawn chooses team/aircraft only. Every plane carries guns and missiles; guns are selected on spawn and F switches weapons during flight.
 * Gameplay now runs the local aircraft simulation and combat world, with live HUD values and match results.
 * P/Escape pauses the local game; losing focus also pauses and clears controls. A future remote server would maintain its own simulation.
-* The server browser and network-session flow remain offline placeholders. Simulate Link Loss still returns globally to the server browser.
+* Network gameplay replication and match start are pending; network lobbies do not silently start local bot gameplay. Simulate Link Loss still returns globally to the server browser in offline mode.
+
+## Networking scaffold
+
+* Joining does not depend on Python. Packaged hosts run their bundled Python interpreter as a separate headless server process.
+* Canceling a join or leaving a hosted lobby closes the owned session/server. Stale connection events cannot reopen canceled screens.
+* Directory registration and discovery are implemented, but Internet deployment, NAT traversal/relay, and production security are pending. See [networking/README.md](networking/README.md).

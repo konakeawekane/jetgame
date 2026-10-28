@@ -54,6 +54,7 @@ impl Radar {
 
 pub struct Aircraft {
     pub body: RigidBody,
+    previous_body: RigidBody,
     pub health: f32,
     pub life: u32,
     pub radar: Radar,
@@ -70,6 +71,7 @@ impl Aircraft {
     fn new(position: Vec3, orientation: Quat, life: u32) -> Self {
         Self {
             body: RigidBody::new(position, orientation),
+            previous_body: RigidBody::new(position, orientation),
             health: 100.,
             life,
             radar: Radar::default(),
@@ -90,6 +92,8 @@ impl Aircraft {
 pub struct Projectile {
     pub position: Vec3,
     pub velocity: Vec3,
+    previous_position: Vec3,
+    previous_velocity: Vec3,
     pub owner: usize,
     pub target: Option<Target>,
     pub missile: bool,
@@ -125,6 +129,30 @@ pub struct World {
 }
 
 impl World {
+    /// One physics tick of visual latency keeps interpolation independent of render rate.
+    pub fn render_alpha(&self) -> f32 {
+        (self.accumulator / FIXED_DT as f64).clamp(0., 1.) as f32
+    }
+
+    pub fn render_body(&self, actor: usize) -> RigidBody {
+        let actor = &self.actors[actor];
+        actor
+            .previous_body
+            .interpolate(actor.body, self.render_alpha())
+    }
+
+    /// Spawn/teleport discontinuities must never blend from an unrelated old position.
+    pub fn snap_render_state(&mut self) {
+        for actor in &mut self.actors {
+            actor.previous_body = actor.body;
+        }
+        for p in &mut self.projectiles {
+            p.previous_position = p.position;
+            p.previous_velocity = p.velocity;
+        }
+        self.accumulator = 0.;
+    }
+
     pub fn hud(
         &self,
         camera: Camera,
@@ -133,6 +161,7 @@ impl World {
         scheme: usize,
     ) -> crate::ui::HudData {
         let player = &self.actors[0];
+        let player_pose = self.render_body(0);
         let project = |point: Vec3| -> Option<[i32; 2]> {
             let projection = camera
                 .view_projection(viewport[0].max(1) as f32 / viewport[1].max(1) as f32)
@@ -160,10 +189,11 @@ impl World {
             .skip(1)
             .filter(|(_, a)| a.alive())
             .filter_map(|(i, a)| {
-                project(a.body.position).map(|position| crate::ui::TargetMarker {
+                let pose = self.render_body(i);
+                project(pose.position).map(|position| crate::ui::TargetMarker {
                     position,
                     number: i,
-                    distance: player.body.position.distance(a.body.position) as u32,
+                    distance: player_pose.position.distance(pose.position) as u32,
                     health: a.health.max(0.) as u8,
                     locked: player.radar.locked
                         && player.radar.target
@@ -208,7 +238,7 @@ impl World {
             } else {
                 None
             },
-            sight: project(player.body.position + player.body.forward() * 1000.),
+            sight: project(player_pose.position + player_pose.forward() * 1000.),
             targets,
         }
     }
@@ -275,7 +305,7 @@ impl World {
         let (p, q) = self.spawn_point(0);
         let life = self.actors[0].life.wrapping_add(1);
         self.actors[0] = Aircraft::new(p, q, life);
-        self.accumulator = 0.;
+        self.snap_render_state();
     }
     pub fn swap_weapon(&mut self) {
         let player = &mut self.actors[0];
@@ -304,6 +334,9 @@ impl World {
         }
     }
     fn step(&mut self, player_input: Controls) {
+        for actor in &mut self.actors {
+            actor.previous_body = actor.body;
+        }
         self.elapsed += FIXED_DT;
         self.last_controls = player_input;
         for i in 0..self.actors.len() {
@@ -516,6 +549,8 @@ impl World {
         self.projectiles.push(Projectile {
             position: body.position + body.forward() * 12. - body.up() * 0.5,
             velocity: body.velocity + body.forward() * if missile { 240. } else { 850. },
+            previous_position: body.position + body.forward() * 12. - body.up() * 0.5,
+            previous_velocity: body.velocity + body.forward() * if missile { 240. } else { 850. },
             owner,
             target,
             missile,
@@ -530,6 +565,8 @@ impl World {
         let mut index = 0;
         while index < self.projectiles.len() {
             let projectile = &mut self.projectiles[index];
+            projectile.previous_position = projectile.position;
+            projectile.previous_velocity = projectile.velocity;
             if let Some(target) = projectile.target {
                 if let Some(actor) = self
                     .actors
@@ -781,23 +818,25 @@ impl GameAssets {
                 transform: cover.transform * self.rocket_model,
             });
         }
-        for actor in &world.actors {
+        for (index, actor) in world.actors.iter().enumerate() {
             if actor.alive() {
+                let pose = world.render_body(index);
                 scene.objects.push(RenderObject {
                     mesh: self.jet,
-                    transform: Mat4::from_rotation_translation(
-                        actor.body.orientation,
-                        actor.body.position,
-                    ) * self.jet_model,
+                    transform: Mat4::from_rotation_translation(pose.orientation, pose.position)
+                        * self.jet_model,
                 });
             }
         }
         for missile in [false, true] {
             for p in world.projectiles.iter().filter(|p| p.missile == missile) {
-                let rotation = Quat::from_rotation_arc(-Vec3::Z, p.velocity.normalize());
+                let alpha = world.render_alpha();
+                let position = p.previous_position.lerp(p.position, alpha);
+                let velocity = p.previous_velocity.lerp(p.velocity, alpha);
+                let rotation = Quat::from_rotation_arc(-Vec3::Z, velocity.normalize());
                 scene.objects.push(RenderObject {
                     mesh: if missile { self.rocket } else { self.bullet },
-                    transform: Mat4::from_rotation_translation(rotation, p.position)
+                    transform: Mat4::from_rotation_translation(rotation, position)
                         * if missile {
                             self.rocket_model
                         } else {
@@ -807,12 +846,13 @@ impl GameAssets {
             }
         }
         for e in &world.explosions {
-            let size = (e.age / 0.7).sqrt() * e.radius + 0.5;
+            let age = (e.age - FIXED_DT + world.render_alpha() * FIXED_DT).max(0.);
+            let size = (age / 0.7).sqrt() * e.radius + 0.5;
             scene.objects.push(RenderObject {
                 mesh: self.effect,
                 transform: Mat4::from_scale_rotation_translation(
                     Vec3::splat(size),
-                    Quat::from_rotation_y(e.age * 4.),
+                    Quat::from_rotation_y(age * 4.),
                     e.position,
                 ),
             });
@@ -890,6 +930,64 @@ mod tests {
     use super::*;
     fn world() -> World {
         World::new(Terrain::new(&MeshData::default(), Mat4::IDENTITY))
+    }
+
+    #[test]
+    fn half_tick_blends_visuals_without_changing_physics() {
+        let mut w = world();
+        w.cover.clear();
+        w.actors.truncate(1);
+        let input = FlightInput::default();
+        let dt = FIXED_DT as f64;
+        let previous = w.actors[0].body.position;
+        w.advance(dt, &input, 0, -Vec3::Z);
+        let authoritative = w.actors[0].body.position;
+        assert_eq!(w.render_body(0).position, previous);
+        w.advance(dt * 0.5, &input, 0, -Vec3::Z);
+        assert!((w.render_alpha() - 0.5).abs() < 1e-5);
+        assert!(
+            w.render_body(0)
+                .position
+                .distance(previous.lerp(authoritative, 0.5))
+                < 1e-4
+        );
+        assert_eq!(w.actors[0].body.position, authoritative);
+    }
+
+    #[test]
+    fn render_frames_between_ticks_keep_advancing_smoothly() {
+        let mut w = world();
+        w.cover.clear();
+        w.actors.truncate(1);
+        let input = FlightInput::default();
+        let dt = FIXED_DT as f64;
+        w.advance(dt, &input, 0, -Vec3::Z);
+        let mut last = w.render_body(0).position;
+        let mut distances = Vec::new();
+        for _ in 0..24 {
+            w.advance(dt * 0.5, &input, 0, -Vec3::Z);
+            let current = w.render_body(0).position;
+            distances.push(last.distance(current));
+            last = current;
+        }
+        let min = distances.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = distances.iter().copied().fold(0., f32::max);
+        assert!(min > 0.5 && max / min < 1.02, "min={min} max={max}");
+    }
+
+    #[test]
+    fn respawning_snaps_poses_instead_of_sweeping_across_the_map() {
+        let mut w = world();
+        let old = w.actors[0].body.position;
+        w.respawn_player(1);
+        assert!(w.actors[0].body.position.distance(old) > 6000.);
+        assert_eq!(w.render_body(0).position, w.actors[0].body.position);
+        w.actors[1].health = 0.;
+        w.actors[1].respawn = 0.;
+        w.actors[1].body.position = Vec3::splat(99999.);
+        w.advance(FIXED_DT as f64, &FlightInput::default(), 0, Vec3::Z);
+        assert!(w.actors[1].alive());
+        assert_eq!(w.render_body(1).position, w.actors[1].body.position);
     }
     #[test]
     fn both_weapons_are_equipped_and_unlocked_missiles_are_fireable() {

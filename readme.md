@@ -1,7 +1,8 @@
 # JetGame
 
 Rust engine for a low-poly multiplayer jet dogfighting game, using `wgpu 0.19`
-and `winit 0.29`. Python networking is planned separately.
+and `winit 0.29`. Native Rust clients connect to a server-only Python networking
+scaffold. See [networking setup and packaging](networking/README.md).
 
 ## Current rendering path
 
@@ -35,6 +36,7 @@ Run commands from the project root:
 cargo run
 cargo run --release
 cargo run -- --preview
+cargo run -- --offline
 cargo run -- --preview --mesh assets/f-16_fighter_jet.glb
 cargo run -- --smoke-test
 cargo run -- --preview --smoke-test
@@ -59,22 +61,23 @@ back to plain panels. An original bitmap font supplies placeholder text.
 - Host name: Enter/click to edit, type ASCII text, Backspace to erase, Enter to finish.
 - Settings opened from pause return to pause. Local gameplay pauses while menus are open.
 
-The browser is explicitly an offline demo. Join the first listed server to enter
-the waiting lobby; mark Ready, then select Preview Match Start. The second server
-demonstrates joining an active match and goes directly to spawn. Hosting creates
-a local placeholder lobby. Select Spawn to fly. Respawn and End Match operate on
-the local round; Simulate Link Loss remains a way to exercise the disconnect flow.
+The default browser uses real directory listings when a directory is configured.
+Hosting launches the headless Python server; joining uses native Rust networking.
+Lobbies synchronize participants and Ready state. Network match start deliberately
+reports that gameplay synchronization is not implemented yet. Use `--offline`
+for the original mock joining flow and local bot matches, or `--preview` to fly
+directly. Respawn, End Match, and Simulate Link Loss exercise the local round.
 
 Host map/mode/player-limit choices are reflected in the lobby. They do not yet
 select a different local game mode or level. All four documented control schemes
 now operate the aircraft. Master Volume controls synthesized radar warnings;
 Music Volume is reserved for a future music player. VSync applies immediately.
-Settings are not persisted yet. Roster entries remain placeholders; gameplay HUD
+Settings are not persisted yet. Offline roster entries are placeholders; gameplay HUD
 speed, altitude, health, ammunition, radar state, and round statistics are live.
 
-Future networking can deliver `ui::SessionEvent` values for connecting, match
-start/end, aircraft destruction, and connection loss. A connection-loss event
-returns to the browser from any screen and clears the session.
+The network worker delivers actual connection/lobby/disconnect events to the UI.
+Future simulation messages can deliver match start/end and aircraft destruction.
+A connection-loss event returns to the browser and clears the session.
 
 UI rendering uses one alpha-blended instanced draw call, a 1024x1024 RGBA atlas
 (4 MiB GPU allocation), and a reusable quad buffer. Images are reduced before
@@ -121,6 +124,13 @@ the coefficients and assistance are gameplay tuning rather than a calibrated F-1
 simulation. Integration background: [rigid-body physics](https://gafferongames.com/post/physics_in_3d/).
 `flight::FlightTuning` contains the main tuning values. Simulation runs at a fixed
 120 Hz with a bounded catch-up step, independently of rendering cadence.
+
+Rendering interpolates the last two physics snapshots using the fractional tick
+remainder: linear position blending and quaternion spherical interpolation for
+orientation. Aircraft, projectile visuals, the chase camera, and target markers
+use the same presentation timeline. Physics, collision, radar, and damage use
+authoritative fixed-step state. This adds one physics tick (about 8.3 ms) of visual
+latency rather than extrapolating. Spawn/teleport snapshots reset to prevent streaking.
 
 The supplied arbitrary terrain mesh is scaled to a 12 km arena with reduced
 vertical relief. Its triangles form a CPU BVH for collision and radar occlusion;
@@ -241,7 +251,7 @@ The UI GPU suite also renders a live flight scene and radar/missile warning scen
 
 Terrain shadow volumes remain a one-time baking task. The forward shader does
 not apply baked shadows yet. Aircraft shadows, textured/per-object materials,
-richer effects, asset streaming, recorded sound effects/music, real networking,
+richer effects, asset streaming, recorded sound effects/music, networked gameplay,
 and further gameplay tuning remain. Clouds are outside immediate scope.
 
 Presentation defaults to `AutoNoVsync` with the backend's supported fallback;

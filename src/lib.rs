@@ -4,6 +4,7 @@ pub mod app;
 pub mod audio;
 pub mod flight;
 pub mod game;
+pub mod networking;
 pub mod rendering;
 pub mod terrain;
 pub mod ui;

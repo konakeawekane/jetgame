@@ -54,6 +54,20 @@ impl RigidBody {
         self.orientation * Vec3::Y
     }
 
+    /// Render-only interpolation between adjacent authoritative physics snapshots.
+    pub fn interpolate(self, current: Self, alpha: f32) -> Self {
+        let alpha = alpha.clamp(0., 1.);
+        Self {
+            position: self.position.lerp(current.position, alpha),
+            velocity: self.velocity.lerp(current.velocity, alpha),
+            orientation: self
+                .orientation
+                .slerp(current.orientation, alpha)
+                .normalize(),
+            angular_velocity: self.angular_velocity.lerp(current.angular_velocity, alpha),
+        }
+    }
+
     pub fn step(&mut self, input: Controls, tuning: FlightTuning, dt: f32) {
         let forward = self.forward();
         let up = self.up();
@@ -256,6 +270,29 @@ pub fn steer_toward(body: RigidBody, direction: Vec3) -> Controls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pose_interpolation_uses_shortest_rotation_and_clamps_endpoints() {
+        let mut previous = RigidBody::new(Vec3::ZERO, Quat::from_rotation_y(170_f32.to_radians()));
+        previous.velocity = Vec3::ZERO;
+        let mut current = previous;
+        current.position = Vec3::X * 10.;
+        current.orientation = Quat::from_rotation_y(-170_f32.to_radians());
+        let midpoint = previous.interpolate(current, 0.5);
+        assert!((midpoint.position.x - 5.).abs() < 1e-5);
+        assert!(
+            midpoint
+                .orientation
+                .dot(Quat::from_rotation_y(std::f32::consts::PI))
+                .abs()
+                > 0.9999
+        );
+        assert_eq!(
+            previous.interpolate(current, -1.).position,
+            previous.position
+        );
+        assert_eq!(previous.interpolate(current, 2.).position, current.position);
+    }
     #[test]
     fn neutral_flight_is_stable_and_finite() {
         let mut body = RigidBody::new(Vec3::Y * 2000., Quat::IDENTITY);

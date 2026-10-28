@@ -2,6 +2,7 @@ use crate::{
     audio::RadarAudio,
     flight::{FlightInput, FlightKey},
     game::{GameAssets, aim_direction, chase_camera},
+    networking::{NetworkClient, NetworkConfig},
     rendering::{FrameContext, RenderError, Renderer},
     ui::{Screen, SessionEvent, UiController, UiKey},
 };
@@ -24,6 +25,9 @@ pub struct RunOptions {
     pub smoke_test: bool,
     pub preview: bool,
     pub mesh: PathBuf,
+    pub offline: bool,
+    pub network: NetworkConfig,
+    pub connect: Option<String>,
 }
 impl Default for RunOptions {
     fn default() -> Self {
@@ -31,6 +35,9 @@ impl Default for RunOptions {
             smoke_test: false,
             preview: false,
             mesh: "assets/f-16_fighter_jet.glb".into(),
+            offline: false,
+            network: NetworkConfig::default(),
+            connect: None,
         }
     }
 }
@@ -49,6 +56,15 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let audio = RadarAudio::new();
     let mut input = FlightInput::default();
     let mut ui = UiController::default();
+    let mut network = if options.offline || options.preview {
+        None
+    } else {
+        ui.enable_networking();
+        Some(NetworkClient::new(options.network))
+    };
+    if let Some(endpoint) = options.connect {
+        ui.connect_direct(endpoint);
+    }
     if options.preview {
         ui.start_preview();
         assets.sync_scene(&world, &mut renderer.scene);
@@ -56,6 +72,7 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
     }
     let start = Instant::now();
     let mut previous_frame = start;
+    let mut previous_simulation = start;
     let mut previous_tick = start;
     let mut next_tick = start;
     let mut previous_screen = ui.screen();
@@ -165,6 +182,48 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                         elapsed_time: now.duration_since(start),
                     };
                     previous_frame = now;
+                    let mut outcome = None;
+                    if ui.is_gameplay() {
+                        let size = window.inner_size();
+                        let viewport = [size.width, size.height];
+                        let ray = aim_direction(renderer.scene.camera, input.mouse, viewport);
+                        let aim = (renderer.scene.camera.eye
+                            + ray
+                                * renderer
+                                    .scene
+                                    .camera
+                                    .eye
+                                    .distance(renderer.scene.camera.target)
+                            - world.actors[0].body.position)
+                            .normalize();
+                        world.advance(
+                            now.duration_since(previous_simulation).as_secs_f64(),
+                            &input,
+                            ui.settings.control_scheme,
+                            aim,
+                        );
+                        previous_simulation = now;
+                        // Presentation follows the same interpolated poses as the visible aircraft.
+                        chase_camera(
+                            &mut renderer.scene.camera,
+                            world.render_body(0),
+                            frame.delta_time.as_secs_f32().min(0.1),
+                            false,
+                        );
+                        assets.sync_scene(&world, &mut renderer.scene);
+                        ui.set_hud(world.hud(
+                            renderer.scene.camera,
+                            viewport,
+                            &input,
+                            ui.settings.control_scheme,
+                        ));
+                        audio.update(world.audio_flags(0), ui.settings.volume);
+                        if world.finished {
+                            outcome = Some(SessionEvent::MatchEnded);
+                        } else if !world.actors[0].alive() {
+                            outcome = Some(SessionEvent::AircraftDestroyed);
+                        }
+                    }
                     renderer.set_vsync(ui.settings.vsync);
                     match renderer.render_with_ui(&frame, ui.frame()) {
                         Ok(true) => {
@@ -185,6 +244,9 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                             fatal_error = Some(error.to_string());
                             target.exit();
                         }
+                    }
+                    if let Some(event) = outcome {
+                        ui.session_event(event);
                     }
                 }
                 _ => {}
@@ -207,39 +269,6 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                     previous_tick = now;
                     ui.tick(delta);
                     let size = window.inner_size();
-                    let viewport = [size.width, size.height];
-                    if ui.is_gameplay() {
-                        let ray = aim_direction(renderer.scene.camera, input.mouse, viewport);
-                        let aim = (renderer.scene.camera.eye
-                            + ray
-                                * renderer
-                                    .scene
-                                    .camera
-                                    .eye
-                                    .distance(renderer.scene.camera.target)
-                            - world.actors[0].body.position)
-                            .normalize();
-                        world.advance(delta.as_secs_f64(), &input, ui.settings.control_scheme, aim);
-                        chase_camera(
-                            &mut renderer.scene.camera,
-                            world.actors[0].body,
-                            delta.as_secs_f32().min(0.1),
-                            false,
-                        );
-                        assets.sync_scene(&world, &mut renderer.scene);
-                        ui.set_hud(world.hud(
-                            renderer.scene.camera,
-                            viewport,
-                            &input,
-                            ui.settings.control_scheme,
-                        ));
-                        audio.update(world.audio_flags(0), ui.settings.volume);
-                        if world.finished {
-                            ui.session_event(SessionEvent::MatchEnded);
-                        } else if !world.actors[0].alive() {
-                            ui.session_event(SessionEvent::AircraftDestroyed);
-                        }
-                    }
                     if !occluded
                         && size.width > 0
                         && size.height > 0
@@ -257,6 +286,16 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                 }
             }
             _ => {}
+        }
+        if let Some(client) = &mut network {
+            for event in client.poll() {
+                ui.network_event(event);
+            }
+            for request in ui.take_network_requests() {
+                if let Err(error) = client.submit(request) {
+                    ui.network_request_failed(error);
+                }
+            }
         }
         let screen = ui.screen();
         if screen != previous_screen {
@@ -291,6 +330,8 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                 _ => {}
             }
             previous_tick = Instant::now();
+            previous_frame = previous_tick;
+            previous_simulation = previous_tick;
             next_tick = previous_tick;
             previous_screen = screen;
             window.request_redraw();

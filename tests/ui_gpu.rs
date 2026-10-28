@@ -321,7 +321,7 @@ fn every_screen_renders_and_keyboard_route_remains_functional() {
         world.advance(jetgame::flight::FIXED_DT as f64, &input, 3, aim);
         jetgame::game::chase_camera(
             &mut camera,
-            world.actors[0].body,
+            world.render_body(0),
             jetgame::flight::FIXED_DT,
             false,
         );
@@ -344,6 +344,7 @@ fn every_screen_renders_and_keyboard_route_remains_functional() {
         position - glam::Vec3::Z * 650.,
         glam::Quat::from_rotation_y(std::f32::consts::PI),
     );
+    world.snap_render_state();
     let player = jetgame::game::Target {
         actor: 0,
         life: world.actors[0].life,
@@ -363,5 +364,43 @@ fn every_screen_renders_and_keyboard_route_remains_functional() {
     jetgame::game::chase_camera(&mut harness.scene.camera, world.actors[0].body, 0., true);
     ui.set_hud(world.hud(harness.scene.camera, [WIDTH, HEIGHT], &input, 3));
     harness.capture(&mut ui, &output, "14_radar_and_missiles");
+    let mut online = UiController::default();
+    online.enable_networking();
+    keys(&mut online, &[UiKey::Enter, UiKey::Enter]);
+    harness.capture(&mut online, &output, "15_online_browser_empty");
+    online.connect_direct("127.0.0.1:29010".into());
+    let op = online
+        .take_network_requests()
+        .into_iter()
+        .find_map(|request| {
+            if let jetgame::networking::Request::Join { op, .. } = request {
+                Some(op)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    harness.capture(&mut online, &output, "16_online_connecting");
+    online.network_event(jetgame::networking::NetworkEvent::Connected {
+        op,
+        info: jetgame::networking::SessionInfo {
+            name: "ONLINE LOBBY".into(),
+            player_id: 1,
+            host: true,
+            max_players: 8,
+            map: "WORLD 01".into(),
+            mode: "TEAM DOGFIGHT".into(),
+            capabilities: vec!["lobby".into()],
+            players: vec![jetgame::networking::PeerInfo {
+                id: 1,
+                name: "PILOT".into(),
+                ready: true,
+                host: true,
+            }],
+        },
+        endpoint: "127.0.0.1:29010".into(),
+    });
+    assert_eq!(online.screen(), Screen::Lobby);
+    harness.capture(&mut online, &output, "17_online_lobby");
     assert!(pollster::block_on(harness.device.pop_error_scope()).is_none());
 }

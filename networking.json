@@ -1,0 +1,8 @@
+{
+  "directory": null,
+  "python": null,
+  "server_script": "networking/server_main.py",
+  "host_bind": "0.0.0.0",
+  "host_port": 29010,
+  "public_port": null
+}

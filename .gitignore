@@ -1,1 +1,7 @@
 /target
+/dist
+/runtime/python
+__pycache__/
+*.pyc
+/.venv
+/networking.local.json

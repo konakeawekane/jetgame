@@ -1,6 +1,9 @@
 //! Small screen controller and retained display list. No game/network state lives in widgets.
 
-use std::time::Duration;
+use crate::networking::{
+    HostOptions, NetworkEvent, PeerInfo, Request as NetworkRequest, ServerListing,
+};
+use std::{collections::VecDeque, time::Duration};
 
 pub const DESIGN_SIZE: [f32; 2] = [1280., 720.];
 
@@ -199,6 +202,8 @@ enum Action {
     Vsync,
     Server(usize),
     Refresh,
+    PreviousPage,
+    NextPage,
     Join,
     Host,
     HostName,
@@ -294,6 +299,14 @@ pub struct UiController {
     hud: HudData,
     message: String,
     pub quit_requested: bool,
+    network_enabled: bool,
+    network_operation: u64,
+    network_requests: VecDeque<NetworkRequest>,
+    server_list: Vec<ServerListing>,
+    server_page: usize,
+    network_roster: Vec<PeerInfo>,
+    local_player: u64,
+    network_endpoint: String,
 }
 
 impl Default for UiController {
@@ -320,11 +333,156 @@ impl Default for UiController {
             hud: HudData::default(),
             message: String::new(),
             quit_requested: false,
+            network_enabled: false,
+            network_operation: 0,
+            network_requests: VecDeque::new(),
+            server_list: Vec::new(),
+            server_page: 0,
+            network_roster: Vec::new(),
+            local_player: 0,
+            network_endpoint: String::new(),
         }
     }
 }
 
 impl UiController {
+    pub fn enable_networking(&mut self) {
+        self.network_enabled = true;
+        self.dirty = true;
+    }
+    pub fn take_network_requests(&mut self) -> VecDeque<NetworkRequest> {
+        std::mem::take(&mut self.network_requests)
+    }
+    fn operation(&mut self) -> u64 {
+        self.network_operation = self.network_operation.wrapping_add(1);
+        self.network_operation
+    }
+    fn discover(&mut self) {
+        let op = self.operation();
+        self.message = "SEARCHING FOR MATCHES...".into();
+        self.network_requests
+            .push_back(NetworkRequest::Discover { op });
+        self.dirty = true;
+    }
+    pub fn connect_direct(&mut self, endpoint: String) {
+        self.network_enabled = true;
+        let op = self.operation();
+        self.session = Some(Session {
+            name: endpoint.clone(),
+            ..Default::default()
+        });
+        self.network_requests
+            .push_back(NetworkRequest::Join { op, endpoint });
+        self.go(Screen::Joining);
+    }
+    pub fn network_request_failed(&mut self, message: String) {
+        self.network_event(NetworkEvent::Error {
+            op: self.network_operation,
+            message,
+        });
+    }
+    pub fn network_event(&mut self, event: NetworkEvent) {
+        match event {
+            NetworkEvent::Servers { op, servers } if op == self.network_operation => {
+                self.server_list = servers;
+                self.selected_server = self
+                    .selected_server
+                    .min(self.server_list.len().saturating_sub(1));
+                self.server_page = 0;
+                self.message = if self.server_list.is_empty() {
+                    "NO MATCHES FOUND".into()
+                } else {
+                    String::new()
+                };
+                self.dirty = true;
+            }
+            NetworkEvent::Connected { op, info, endpoint }
+                if op == self.network_operation && self.screen == Screen::Joining =>
+            {
+                self.local_player = info.player_id;
+                self.network_roster = info.players;
+                self.network_endpoint = endpoint;
+                self.session = Some(Session {
+                    host: info.host,
+                    name: info.name,
+                    ready: self
+                        .network_roster
+                        .iter()
+                        .any(|p| p.id == info.player_id && p.ready),
+                    map: MAPS.iter().position(|name| *name == info.map).unwrap_or(0),
+                    mode: MODES
+                        .iter()
+                        .position(|name| *name == info.mode)
+                        .unwrap_or(0),
+                    max_players: info.max_players,
+                });
+                self.message.clear();
+                self.go(Screen::Lobby);
+            }
+            NetworkEvent::Lobby { op, players } if op == self.network_operation => {
+                if let Some(session) = &mut self.session {
+                    session.ready = players.iter().any(|p| p.id == self.local_player && p.ready);
+                }
+                self.network_roster = players;
+                self.dirty = true;
+            }
+            NetworkEvent::Error { op, message } if op == self.network_operation => {
+                if self.screen == Screen::Joining {
+                    self.leave();
+                }
+                self.message = message.to_uppercase();
+                self.dirty = true;
+            }
+            NetworkEvent::Disconnected { op, reason } if op == self.network_operation => {
+                self.session_event(SessionEvent::ConnectionLost(reason))
+            }
+            NetworkEvent::WorkerStopped => {
+                if self.session.is_some() {
+                    self.session_event(SessionEvent::ConnectionLost(
+                        "NETWORK SERVICE STOPPED".into(),
+                    ));
+                } else {
+                    self.message = "NETWORK SERVICE STOPPED".into();
+                    self.dirty = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn browser_rows(&self) -> Vec<(usize, String, String)> {
+        if self.network_enabled {
+            self.server_list
+                .iter()
+                .enumerate()
+                .skip(self.server_page * 3)
+                .take(3)
+                .map(|(i, s)| {
+                    (
+                        i,
+                        s.name.chars().take(26).collect(),
+                        format!(
+                            "{:<10} {:2} / {:2}   {}",
+                            if s.in_progress { "IN MATCH" } else { "LOBBY" },
+                            s.players,
+                            s.max_players,
+                            if s.reachability == "verified" {
+                                "DIRECT"
+                            } else {
+                                "UNVERIFIED"
+                            }
+                        ),
+                    )
+                })
+                .collect()
+        } else {
+            SERVERS
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, s.0.into(), s.1.into()))
+                .collect()
+        }
+    }
     pub fn screen(&self) -> Screen {
         self.screen
     }
@@ -378,9 +536,11 @@ impl UiController {
         self.timer += delta.as_secs_f32();
         match self.screen {
             Screen::Splash if self.timer >= 2.0 => self.go(Screen::Start),
-            Screen::Joining if self.timer >= 1.2 => self.session_event(SessionEvent::Connected {
-                match_in_progress: SERVERS[self.selected_server].2,
-            }),
+            Screen::Joining if !self.network_enabled && self.timer >= 1.2 => {
+                self.session_event(SessionEvent::Connected {
+                    match_in_progress: SERVERS[self.selected_server].2,
+                })
+            }
             Screen::Joining | Screen::Splash
                 if (previous * 20.) as u32 != (self.timer * 20.) as u32 =>
             {
@@ -393,6 +553,11 @@ impl UiController {
     pub fn session_event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::ConnectionLost(reason) => {
+                if self.network_enabled {
+                    self.operation();
+                    self.network_requests.push_back(NetworkRequest::Leave);
+                    self.network_roster.clear();
+                }
                 self.session = None;
                 self.message = format!("CONNECTION LOST: {}", reason.to_uppercase());
                 self.go(Screen::ServerBrowser);
@@ -547,6 +712,11 @@ impl UiController {
     }
 
     fn leave(&mut self) {
+        if self.network_enabled {
+            self.operation();
+            self.network_requests.push_back(NetworkRequest::Leave);
+            self.network_roster.clear();
+        }
         self.session = None;
         self.message = "OFFLINE PREVIEW / NO NETWORK CONNECTION".into();
         self.go(Screen::ServerBrowser);
@@ -584,7 +754,11 @@ impl UiController {
         match action {
             Action::Continue => self.go(Screen::Start),
             Action::Play => {
-                self.message = "OFFLINE PREVIEW / SIMULATED SERVERS".into();
+                if self.network_enabled {
+                    self.discover();
+                } else {
+                    self.message = "OFFLINE PREVIEW / SIMULATED SERVERS".into();
+                }
                 self.go(Screen::ServerBrowser);
             }
             Action::Settings => {
@@ -602,10 +776,30 @@ impl UiController {
                 self.dirty = true;
             }
             Action::Refresh => {
-                self.message = "DEMO LIST REFRESHED / REAL DISCOVERY NOT IMPLEMENTED".into();
+                if self.network_enabled {
+                    self.discover();
+                } else {
+                    self.message = "DEMO LIST REFRESHED / REAL DISCOVERY NOT IMPLEMENTED".into();
+                }
+                self.dirty = true;
+            }
+            Action::PreviousPage => {
+                self.server_page = self.server_page.saturating_sub(1);
+                self.dirty = true;
+            }
+            Action::NextPage => {
+                if (self.server_page + 1) * 3 < self.server_list.len() {
+                    self.server_page += 1;
+                }
                 self.dirty = true;
             }
             Action::Join => {
+                if self.network_enabled {
+                    if let Some(server) = self.server_list.get(self.selected_server) {
+                        self.connect_direct(server.endpoint.clone());
+                    }
+                    return;
+                }
                 self.session = Some(Session {
                     host: false,
                     name: SERVERS[self.selected_server].0.into(),
@@ -634,15 +828,42 @@ impl UiController {
                     mode: self.host_mode,
                     max_players: [2, 4, 8, 16][self.host_max],
                 });
-                self.go(Screen::Lobby);
+                if self.network_enabled {
+                    let options = HostOptions {
+                        name: name.into(),
+                        max_players: [2, 4, 8, 16][self.host_max],
+                        map: MAPS[self.host_map].into(),
+                        mode: MODES[self.host_mode].into(),
+                    };
+                    let op = self.operation();
+                    self.network_requests
+                        .push_back(NetworkRequest::Host { op, options });
+                    self.go(Screen::Joining);
+                } else {
+                    self.go(Screen::Lobby);
+                }
             }
             Action::Ready => {
                 if let Some(session) = &mut self.session {
                     session.ready = !session.ready;
+                    if self.network_enabled {
+                        self.network_requests.push_back(NetworkRequest::Ready {
+                            op: self.network_operation,
+                            ready: session.ready,
+                        });
+                    }
                 }
                 self.dirty = true;
             }
-            Action::StartMatch => self.session_event(SessionEvent::MatchStarted),
+            Action::StartMatch => {
+                if self.network_enabled {
+                    self.network_requests.push_back(NetworkRequest::Start {
+                        op: self.network_operation,
+                    });
+                } else {
+                    self.session_event(SessionEvent::MatchStarted);
+                }
+            }
             Action::Spawn | Action::Resume => self.go(Screen::Gameplay),
             Action::Respawn => self.session_event(SessionEvent::AircraftDestroyed),
             Action::EndMatch => self.session_event(SessionEvent::MatchEnded),
@@ -714,7 +935,16 @@ impl UiController {
                 paint.panel(Rect::new(770., 350., 440., 215.));
                 paint.text([796., 378.], "FLIGHT SYSTEMS ONLINE", 2., CYAN);
                 paint.text([796., 424.], "AIRCRAFT SYSTEMS READY", 1.5, WHITE);
-                paint.text([796., 458.], "NETWORK: OFFLINE PREVIEW", 1.5, MUTED);
+                paint.text(
+                    [796., 458.],
+                    if self.network_enabled {
+                        "HOST OR FIND A MATCH"
+                    } else {
+                        "NETWORK: OFFLINE PREVIEW"
+                    },
+                    1.5,
+                    MUTED,
+                );
                 paint.text([796., 492.], "ALL MENUS AVAILABLE", 1.5, MUTED);
             }
             Screen::Settings => {
@@ -762,17 +992,28 @@ impl UiController {
             Screen::ServerBrowser => {
                 paint.header(
                     "SERVER BROWSER",
-                    "OFFLINE PREVIEW  /  SELECT A SERVER, THEN JOIN",
+                    if self.network_enabled {
+                        "SELECT A SERVER, THEN JOIN"
+                    } else {
+                        "OFFLINE PREVIEW  /  SELECT A SERVER, THEN JOIN"
+                    },
                 );
                 paint.panel(Rect::new(64., 154., 1152., 320.));
                 paint.text([90., 179.], "SERVER", 1.5, CYAN);
                 paint.text([578., 179.], "STATUS     PLAYERS     NETWORK", 1.5, CYAN);
-                for (i, (name, _, _)) in SERVERS.iter().enumerate() {
-                    let y = 218. + i as f32 * 76.;
-                    if i == self.selected_server {
+                for (row, (i, name, _)) in self.browser_rows().iter().enumerate() {
+                    let y = 218. + row as f32 * 76.;
+                    if *i == self.selected_server {
                         paint.rect(Rect::new(68., y, 4., 58.), CYAN);
                     }
-                    paint.button(Rect::new(84., y, 1112., 58.), name, Action::Server(i));
+                    paint.button(Rect::new(84., y, 1112., 58.), name, Action::Server(*i));
+                }
+                if self.network_enabled && self.server_list.is_empty() {
+                    paint.text([94., 270.], "NO MATCHES FOUND", 2., MUTED);
+                }
+                if self.network_enabled && self.server_list.len() > 3 {
+                    paint.button(Rect::new(1010., 170., 80., 30.), "<", Action::PreviousPage);
+                    paint.button(Rect::new(1110., 170., 80., 30.), ">", Action::NextPage);
                 }
                 for (i, (label, action)) in [
                     ("REFRESH", Action::Refresh),
@@ -783,10 +1024,13 @@ impl UiController {
                 .into_iter()
                 .enumerate()
                 {
-                    paint.button(
+                    paint.enabled_button(
                         Rect::new(64. + i as f32 * 294., 516., 270., 54.),
                         label,
                         action,
+                        action != Action::Join
+                            || !self.network_enabled
+                            || !self.server_list.is_empty(),
                     );
                 }
                 paint.notice(&self.message);
@@ -794,20 +1038,35 @@ impl UiController {
             Screen::Joining => {
                 paint.header(
                     "JOINING MATCH",
-                    "OFFLINE PREVIEW / CONNECTING TO A SIMULATED SESSION",
+                    if self.network_enabled {
+                        "CONNECTING TO SERVER"
+                    } else {
+                        "OFFLINE PREVIEW / CONNECTING TO A SIMULATED SESSION"
+                    },
                 );
                 paint.panel(Rect::new(260., 230., 760., 240.));
                 paint.text([294., 263.], session_name, 2., WHITE);
                 paint.text([294., 310.], "ESTABLISHING SESSION...", 1.5, MUTED);
                 paint.rect(Rect::new(294., 352., 690., 8.), BORDER);
                 paint.rect(
-                    Rect::new(294., 352., 690. * (self.timer / 1.2).min(1.), 8.),
+                    if self.network_enabled {
+                        Rect::new(294. + 600. * (self.timer * 0.4).fract(), 352., 90., 8.)
+                    } else {
+                        Rect::new(294., 352., 690. * (self.timer / 1.2).min(1.), 8.)
+                    },
                     CYAN,
                 );
                 paint.button(Rect::new(448., 395., 384., 48.), "CANCEL", Action::Leave);
             }
             Screen::Host => {
-                paint.header("HOST MATCH", "CONFIGURE AN OFFLINE PREVIEW SESSION");
+                paint.header(
+                    "HOST MATCH",
+                    if self.network_enabled {
+                        "CONFIGURE YOUR SERVER"
+                    } else {
+                        "CONFIGURE AN OFFLINE PREVIEW SESSION"
+                    },
+                );
                 paint.panel(Rect::new(260., 150., 760., 470.));
                 let cursor = if self.editing { "_" } else { "" };
                 let labels = [
@@ -815,7 +1074,11 @@ impl UiController {
                     format!("MODE: < {} >", MODES[self.host_mode]),
                     format!("MAP: < {} >", MAPS[self.host_map]),
                     format!("PLAYER LIMIT: < {} >", [2, 4, 8, 16][self.host_max]),
-                    "CREATE PREVIEW LOBBY".into(),
+                    if self.network_enabled {
+                        "CREATE LOBBY".into()
+                    } else {
+                        "CREATE PREVIEW LOBBY".into()
+                    },
                     "CANCEL".into(),
                 ];
                 for (i, (label, action)) in labels
@@ -848,20 +1111,54 @@ impl UiController {
                 paint.panel(Rect::new(64., 160., 1152., 340.));
                 paint.text([94., 188.], "PILOT ROSTER", 2., CYAN);
                 let ready = self.session.as_ref().is_some_and(|s| s.ready);
-                paint.text(
-                    [94., 244.],
-                    if ready {
-                        "YOU                 READY"
-                    } else {
-                        "YOU                 NOT READY"
-                    },
-                    2.,
-                    WHITE,
-                );
-                paint.text([94., 294.], "WINGMAN             PLACEHOLDER", 1.5, MUTED);
-                paint.text([94., 338.], "OPPONENT            PLACEHOLDER", 1.5, MUTED);
-                paint.text([782., 244.], "OFFLINE SESSION", 2., CYAN);
-                paint.text([782., 294.], "NO REAL PLAYERS CONNECTED", 1.5, MUTED);
+                if self.network_enabled {
+                    for (i, player) in self.network_roster.iter().take(8).enumerate() {
+                        let name: String = player.name.chars().take(20).collect();
+                        let prefix = if player.id == self.local_player {
+                            "YOU / "
+                        } else {
+                            ""
+                        };
+                        paint.text(
+                            [94., 236. + i as f32 * 28.],
+                            &format!("{prefix}{name}"),
+                            1.5,
+                            WHITE,
+                        );
+                        paint.text(
+                            [470., 236. + i as f32 * 28.],
+                            if player.ready { "READY" } else { "NOT READY" },
+                            1.5,
+                            if player.ready { CYAN } else { MUTED },
+                        );
+                    }
+                    if self.network_roster.len() > 8 {
+                        paint.text(
+                            [94., 470.],
+                            &format!("+ {} MORE PILOTS", self.network_roster.len() - 8),
+                            1.5,
+                            MUTED,
+                        );
+                    }
+                    paint.text([782., 244.], "CONNECTED", 2., CYAN);
+                    let endpoint: String = self.network_endpoint.chars().take(36).collect();
+                    paint.text([782., 294.], &endpoint, 1.2, MUTED);
+                } else {
+                    paint.text(
+                        [94., 244.],
+                        if ready {
+                            "YOU                 READY"
+                        } else {
+                            "YOU                 NOT READY"
+                        },
+                        2.,
+                        WHITE,
+                    );
+                    paint.text([94., 294.], "WINGMAN             PLACEHOLDER", 1.5, MUTED);
+                    paint.text([94., 338.], "OPPONENT            PLACEHOLDER", 1.5, MUTED);
+                    paint.text([782., 244.], "OFFLINE SESSION", 2., CYAN);
+                    paint.text([782., 294.], "NO REAL PLAYERS CONNECTED", 1.5, MUTED);
+                }
                 if let Some(session) = &self.session {
                     paint.text(
                         [782., 338.],
@@ -890,19 +1187,24 @@ impl UiController {
                 );
                 paint.enabled_button(
                     Rect::new(464., 538., 352., 54.),
-                    if host {
+                    if self.network_enabled {
+                        if host { "START MATCH" } else { "AWAITING HOST" }
+                    } else if host {
                         "START MATCH PREVIEW"
                     } else {
                         "PREVIEW MATCH START"
                     },
                     Action::StartMatch,
-                    ready,
+                    ready && (!self.network_enabled || host),
                 );
                 paint.button(
                     Rect::new(864., 538., 352., 54.),
                     "LEAVE LOBBY",
                     Action::Leave,
                 );
+                if self.network_enabled {
+                    paint.notice(&self.message);
+                }
             }
             Screen::Spawn => {
                 paint.header("AIRCRAFT DEPLOYMENT", "SELECT YOUR TEAM");
@@ -1169,7 +1471,7 @@ impl UiController {
         }
         // Server metadata is drawn over row backgrounds.
         if self.screen == Screen::ServerBrowser {
-            for (i, (_, info, _)) in SERVERS.iter().enumerate() {
+            for (i, (_, _, info)) in self.browser_rows().iter().enumerate() {
                 paint.text([578., 240. + i as f32 * 76.], info, 1.5, MUTED);
             }
         }
@@ -1500,6 +1802,85 @@ mod tests {
         ui.tick(Duration::from_secs(30));
         assert!(!ui.needs_redraw());
         assert_eq!(ui.frame().revision, revision);
+    }
+
+    #[test]
+    fn network_join_waits_for_real_events_and_cancel_ignores_stale_success() {
+        let mut ui = UiController::default();
+        ui.enable_networking();
+        ui.connect_direct("127.0.0.1:29010".into());
+        let old = ui.network_operation;
+        ui.tick(Duration::from_secs(10));
+        assert_eq!(ui.screen(), Screen::Joining);
+        ui.key(UiKey::Back);
+        assert_eq!(ui.screen(), Screen::ServerBrowser);
+        ui.network_event(NetworkEvent::Connected {
+            op: old,
+            endpoint: "127.0.0.1:29010".into(),
+            info: crate::networking::SessionInfo {
+                name: "STALE".into(),
+                player_id: 1,
+                host: false,
+                max_players: 8,
+                map: MAPS[0].into(),
+                mode: MODES[0].into(),
+                capabilities: vec!["lobby".into()],
+                players: vec![],
+            },
+        });
+        assert_eq!(ui.screen(), Screen::ServerBrowser);
+        assert!(ui.session.is_none());
+    }
+
+    #[test]
+    fn network_start_does_not_run_offline_bots_as_fake_multiplayer() {
+        let mut ui = UiController::default();
+        ui.enable_networking();
+        ui.session = Some(Session {
+            host: true,
+            ready: true,
+            ..Default::default()
+        });
+        ui.go(Screen::Lobby);
+        select(&mut ui, Action::StartMatch);
+        assert_eq!(ui.screen(), Screen::Lobby);
+        assert!(matches!(
+            ui.network_requests.back(),
+            Some(NetworkRequest::Start { .. })
+        ));
+        ui.network_request_failed("Online gameplay synchronization is not implemented".into());
+        assert_eq!(ui.screen(), Screen::Lobby);
+    }
+
+    #[test]
+    fn network_browser_pages_and_disables_join_when_empty() {
+        let mut ui = UiController::default();
+        ui.enable_networking();
+        ui.go(Screen::ServerBrowser);
+        ui.ensure_layout();
+        assert!(
+            !ui.widgets
+                .iter()
+                .find(|w| w.action == Action::Join)
+                .unwrap()
+                .enabled
+        );
+        ui.network_event(NetworkEvent::Servers {
+            op: 0,
+            servers: (0..8)
+                .map(|i| ServerListing {
+                    id: i.to_string(),
+                    name: format!("SERVER {i}"),
+                    endpoint: format!("127.0.0.1:{}", 29010 + i),
+                    players: 0,
+                    max_players: 8,
+                    in_progress: false,
+                    reachability: "unverified".into(),
+                })
+                .collect(),
+        });
+        select(&mut ui, Action::NextPage);
+        assert_eq!(ui.browser_rows()[0].0, 3);
     }
 
     #[test]
