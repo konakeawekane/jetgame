@@ -54,7 +54,8 @@
 * Spawn chooses team/aircraft only. Every plane carries guns and missiles; guns are selected on spawn and F switches weapons during flight.
 * Gameplay now runs the local aircraft simulation and combat world, with live HUD values and match results.
 * P/Escape pauses the local game; losing focus also pauses and clears controls. A future remote server would maintain its own simulation.
-* Network gameplay replication and match start are pending; network lobbies do not silently start local bot gameplay. Simulate Link Loss still returns globally to the server browser in offline mode.
+* The host starts a round after everyone is ready. Players select teams and request spawn; the host validates spawning and respawn cooldowns. The host owns physics/combat/bots; guests predict flight and receive authoritative updates. Late joining leads directly to spawn.
+* Online P/Escape menus and focus loss clear local controls without pausing the shared simulation. End Match is host-only. Leaving or losing the host returns to the browser.
 
 ## Networking scaffold
 

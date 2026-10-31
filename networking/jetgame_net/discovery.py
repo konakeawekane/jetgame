@@ -96,7 +96,7 @@ async def discover(settings):
                 if len(results) < settings.max_listings:
                     key = (match_id, addr[0], port)
                     results[key] = {"id": match_id, "name": name, "endpoint": endpoint(addr[0], port), "players": count,
-                                    "max_players": maximum, "in_progress": False, "reachability": "LAN"}
+                                    "max_players": maximum, "in_progress": message.get("in_progress") is True, "reachability": "LAN"}
             except (ValueError, KeyError, TypeError, UnicodeError):
                 pass
 

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -28,7 +29,7 @@ async def run(args):
     loop = asyncio.get_running_loop()
     if args.parent_stdin:
         def watch():
-            while sys.stdin.buffer.read(1):
+            while os.read(sys.stdin.fileno(), 1):
                 pass
             if not loop.is_closed():
                 loop.call_soon_threadsafe(stopped.set)

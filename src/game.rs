@@ -7,7 +7,10 @@ use crate::{
 };
 use glam::{Mat4, Quat, Vec3};
 
+pub mod multiplayer;
+pub mod net_types;
 mod presentation;
+mod replication;
 pub use presentation::{GameAssets, aim_direction, chase_camera};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,6 +53,14 @@ impl Radar {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct AircraftStats {
+    pub kills: u32,
+    pub deaths: u32,
+    pub shots: u32,
+    pub hits: u32,
+}
+
 pub struct Aircraft {
     pub body: RigidBody,
     previous_body: RigidBody,
@@ -59,6 +70,8 @@ pub struct Aircraft {
     pub weapon: Weapon,
     pub gun_ammo: u32,
     pub missiles: u32,
+    pub team: u8,
+    pub stats: AircraftStats,
     cooldown: f32,
     invulnerable: f32,
     respawn: f32,
@@ -76,6 +89,8 @@ impl Aircraft {
             weapon: Weapon::Guns,
             gun_ammo: rules.gun_ammo,
             missiles: rules.missiles,
+            team: 0,
+            stats: AircraftStats::default(),
             cooldown: 0.,
             invulnerable: rules.spawn_protection_seconds,
             respawn: 0.,
@@ -88,6 +103,7 @@ impl Aircraft {
 }
 
 pub struct Projectile {
+    pub id: u32,
     pub position: Vec3,
     pub velocity: Vec3,
     previous_position: Vec3,
@@ -98,6 +114,7 @@ pub struct Projectile {
     remaining: f32,
 }
 pub struct Explosion {
+    pub id: u32,
     pub position: Vec3,
     pub age: f32,
     pub radius: f32,
@@ -123,6 +140,15 @@ pub struct World {
     pub tuning: FlightTuning,
     pub rules: MatchRules,
     pub last_controls: Controls,
+    pub local_actor: usize,
+    online: bool,
+    human_slots: usize,
+    free_for_all: bool,
+    remote_audio: Option<u8>,
+    visual_offset: Vec3,
+    visual_rotation: Quat,
+    next_projectile: u32,
+    next_explosion: u32,
     accumulator: f64,
     team: usize,
 }
@@ -135,9 +161,14 @@ impl World {
 
     pub fn render_body(&self, actor: usize) -> RigidBody {
         let actor = &self.actors[actor];
-        actor
+        let mut pose = actor
             .previous_body
-            .interpolate(actor.body, self.render_alpha())
+            .interpolate(actor.body, self.render_alpha());
+        if std::ptr::eq(actor, &self.actors[self.local_actor]) {
+            pose.position += self.visual_offset;
+            pose.orientation = (self.visual_rotation * pose.orientation).normalize();
+        }
+        pose
     }
 
     /// Spawn/teleport discontinuities must never blend from an unrelated old position.
@@ -172,6 +203,15 @@ impl World {
             tuning: config.flight,
             rules,
             last_controls: Controls::default(),
+            local_actor: 0,
+            online: false,
+            human_slots: 1,
+            free_for_all: false,
+            remote_audio: None,
+            visual_offset: Vec3::ZERO,
+            visual_rotation: Quat::IDENTITY,
+            next_projectile: 1,
+            next_explosion: 1,
             accumulator: 0.,
             team: 0,
         };
@@ -199,6 +239,11 @@ impl World {
         )
     }
     pub fn reset(&mut self, team: usize) {
+        self.online = false;
+        self.local_actor = 0;
+        self.remote_audio = None;
+        self.visual_offset = Vec3::ZERO;
+        self.visual_rotation = Quat::IDENTITY;
         self.team = team;
         self.actors.clear();
         for i in 0..=self.rules.bot_count {
@@ -219,7 +264,10 @@ impl World {
         self.team = team;
         let (p, q) = self.spawn_point(0);
         let life = self.actors[0].life.wrapping_add(1);
+        let stats = self.actors[0].stats;
         self.actors[0] = Aircraft::new(p, q, life, self.rules);
+        self.actors[0].stats = stats;
+        self.update_local_stats();
         self.snap_render_state();
     }
     pub fn swap_weapon(&mut self) {
@@ -255,15 +303,26 @@ impl World {
             actor.previous_body = actor.body;
         }
         self.elapsed += self.rules.fixed_dt();
-        self.last_controls = inputs.first().copied().flatten().unwrap_or_default();
+        self.last_controls = inputs
+            .get(self.local_actor)
+            .copied()
+            .flatten()
+            .unwrap_or_default();
         for i in 0..self.actors.len() {
             if !self.actors[i].alive() {
-                if inputs.get(i).copied().flatten().is_none() {
+                if self.online || inputs.get(i).copied().flatten().is_none() {
                     self.actors[i].respawn -= self.rules.fixed_dt();
-                    if self.actors[i].respawn <= 0. {
-                        let (p, q) = self.spawn_point(i);
+                    if self.actors[i].respawn <= 0. && inputs.get(i).copied().flatten().is_none() {
+                        let (p, q) = if self.online {
+                            self.network_spawn_point(i, self.actors[i].team)
+                        } else {
+                            self.spawn_point(i)
+                        };
                         let life = self.actors[i].life.wrapping_add(1);
-                        self.actors[i] = Aircraft::new(p, q, life, self.rules);
+                        let (team, stats) = (self.actors[i].team, self.actors[i].stats);
+                        self.actors[i] = Aircraft::new(p, q, life.max(1), self.rules);
+                        self.actors[i].team = team;
+                        self.actors[i].stats = stats;
                     }
                 }
                 continue;
@@ -272,7 +331,7 @@ impl World {
                 controls
             } else {
                 let body = self.actors[i].body;
-                let player = self.actors[0].body;
+                let player = self.actors[self.bot_target(i).unwrap_or(0)].body;
                 let chasing = (self.elapsed * 0.12 + i as f32).sin() > 0.;
                 let waypoint = if chasing && body.position.distance(player.position) > 220. {
                     player.position + player.velocity * 0.8
@@ -355,9 +414,10 @@ impl World {
                     self.fire(i);
                 }
             } else {
-                let player = self.actors[0].body.position;
+                let target = self.bot_target(i);
+                let player = self.actors[target.unwrap_or(0)].body.position;
                 let body = self.actors[i].body;
-                if self.actors[0].alive()
+                if target.is_some()
                     && body
                         .forward()
                         .dot((player - body.position).normalize_or_zero())
@@ -379,8 +439,12 @@ impl World {
             explosion.age += self.rules.fixed_dt();
         }
         self.explosions.retain(|e| e.age < 0.7);
-        self.finished =
-            self.elapsed >= self.rules.round_seconds || self.kills >= self.rules.kill_limit;
+        self.finished = self.elapsed >= self.rules.round_seconds
+            || self
+                .actors
+                .iter()
+                .any(|a| a.stats.kills >= self.rules.kill_limit);
+        self.update_local_stats();
     }
     fn visible_target(&self, source: usize, target: usize, holding: bool) -> bool {
         let a = &self.actors[source];
@@ -389,7 +453,7 @@ impl World {
         a.alive()
             && b.alive()
             && source != target
-            && (source == 0 || target == 0)
+            && self.enemies(source, target)
             && difference.length_squared() <= self.rules.radar_range * self.rules.radar_range
             && a.body.forward().dot(difference.normalize_or_zero())
                 > if holding {
@@ -468,7 +532,7 @@ impl World {
                 return false;
             }
             actor.gun_ammo -= 1;
-            actor.cooldown = if owner == 0 {
+            actor.cooldown = if owner < self.human_slots {
                 1. / self.rules.gun_hz
             } else {
                 1. / self.rules.bot_gun_hz
@@ -481,6 +545,7 @@ impl World {
         };
         let body = actor.body;
         self.projectiles.push(Projectile {
+            id: self.next_projectile,
             position: body.position + body.forward() * 12. - body.up() * 0.5,
             velocity: body.velocity + body.forward() * if missile { 240. } else { 850. },
             previous_position: body.position + body.forward() * 12. - body.up() * 0.5,
@@ -490,6 +555,8 @@ impl World {
             missile,
             remaining: if missile { 8. } else { 2.5 },
         });
+        self.next_projectile = self.next_projectile.wrapping_add(1).max(1);
+        self.actors[owner].stats.shots += 1;
         if owner == 0 {
             self.shots += 1;
         }
@@ -544,7 +611,11 @@ impl World {
                 }
             }
             for (actor, aircraft) in self.actors.iter().enumerate() {
-                if actor == owner || !aircraft.alive() || aircraft.invulnerable > 0. {
+                if actor == owner
+                    || !aircraft.alive()
+                    || aircraft.invulnerable > 0.
+                    || (self.online && !self.enemies(owner, actor))
+                {
                     continue;
                 }
                 if let Some(t) = segment_sphere(
@@ -568,6 +639,7 @@ impl World {
                     } else {
                         self.rules.gun_damage
                     };
+                    self.actors[owner].stats.hits += 1;
                     if owner == 0 {
                         self.hits += 1;
                     }
@@ -592,6 +664,10 @@ impl World {
         self.actors[actor].health = 0.;
         self.actors[actor].radar = Radar::default();
         self.actors[actor].respawn = self.rules.respawn_seconds;
+        self.actors[actor].stats.deaths += 1;
+        if let Some(killer) = killer.filter(|&k| k != actor) {
+            self.actors[killer].stats.kills += 1;
+        }
         if actor == 0 {
             self.deaths += 1;
         } else if killer == Some(0) {
@@ -602,14 +678,21 @@ impl World {
     fn blast(&mut self, position: Vec3, radius: f32) {
         if self.explosions.len() < 48 {
             self.explosions.push(Explosion {
+                id: self.next_explosion,
                 position,
                 age: 0.,
                 radius,
             });
+            self.next_explosion = self.next_explosion.wrapping_add(1).max(1);
         }
     }
     /// Flags are per receiver: outgoing lock, incoming radar lock, incoming guided missile.
     pub fn audio_flags(&self, receiver: usize) -> u8 {
+        if receiver == self.local_actor {
+            if let Some(flags) = self.remote_audio {
+                return flags;
+            }
+        }
         let Some(actor) = self.actors.get(receiver).filter(|a| a.alive()) else {
             return 0;
         };
@@ -676,6 +759,15 @@ mod tests {
     use glam::Vec2;
     fn world() -> World {
         World::new(Terrain::new(&MeshData::default(), Mat4::IDENTITY))
+    }
+    #[test]
+    fn offline_respawn_keeps_round_statistics() {
+        let mut w = world();
+        w.request_respawn();
+        w.respawn_player(0);
+        w.advance(FIXED_DT as f64, &FlightInput::default(), 0, -Vec3::Z);
+        assert_eq!(w.deaths, 1);
+        assert_eq!(w.actors[0].stats.deaths, 1);
     }
 
     #[test]

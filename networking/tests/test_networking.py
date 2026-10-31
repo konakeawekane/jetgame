@@ -61,7 +61,9 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         await guest.send("start_match")
         self.assertEqual((await self.until_kind(guest, "error"))["payload"]["code"], "host_required")
         await host.send("start_match")
-        self.assertEqual((await self.until_kind(host, "error"))["payload"]["code"], "gameplay_not_implemented")
+        prepare = (await self.until_kind(host, "prepare"))["payload"]
+        self.assertEqual(prepare["capacity"], 2)
+        self.assertEqual([p["slot"] for p in prepare["players"]], [0, 1])
 
     async def test_capacity_and_malformed_commands_do_not_kill_server(self):
         first = await self.join()
@@ -70,6 +72,26 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await self.join()
         await first.send("ready", {"ready": "yes"})
         self.assertIn("boolean", (await self.until_kind(first, "error"))["payload"]["message"])
+
+    async def test_guest_cannot_end_an_active_round_and_stale_actions_are_ignored(self):
+        host, guest = await self.join(True), await self.join()
+        await self.until_kind(guest, "lobby")
+        await guest.send("ready", {"ready": True})
+        await self.until_kind(guest, "lobby")
+        await host.send("start_match")
+        prepare = (await self.until_kind(host, "prepare"))["payload"]
+        epoch = prepare["epoch"]
+        await self.server.begin({"epoch": epoch, "capacity": 2,
+                                 "rules": {"physics_hz": 120, "bot_count": 0, "max_projectiles": 256},
+                                 "sync": {"max_packet_bytes": 1200, "actor_chunk": 4, "projectile_chunk": 24, "input_hz": 20, "snapshot_hz": 20}})
+        await self.until_kind(guest, "game_started")
+        await guest.send("game_action", {"epoch": epoch, "action": "end", "action_id": 1, "team": 1})
+        error = await self.until_kind(guest, "error")
+        self.assertIn("Only the host", error["payload"]["message"])
+        await guest.send("game_action", {"epoch": epoch - 1 or epoch + 1, "action": "spawn", "action_id": 2, "team": 1})
+        await guest.send("ping")
+        self.assertEqual((await self.until_kind(guest, "pong"))["kind"], "pong")
+        self.assertIsNotNone(self.server.game)
 
     async def test_ipv6_is_tried_before_ipv4_and_ipv4_fallback_connects(self):
         link = make_link([f"127.0.0.1:{self.server.port}", f"[::1]:{self.server.port}"], self.server.lobby.id)

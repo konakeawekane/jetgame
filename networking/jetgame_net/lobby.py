@@ -29,7 +29,7 @@ class Lobby:
     def welcome(self, player_id):
         return {"id": self.id, "name": self.name, "player_id": player_id,
                 "host": self.players[player_id]["host"], "max_players": self.max_players,
-                "map": self.map_name, "mode": self.mode, "capabilities": ["lobby"], "players": self.roster()}
+                "map": self.map_name, "mode": self.mode, "capabilities": ["lobby", "gameplay_v1"], "players": self.roster()}
 
     def roster(self):
         return list(self.players.values())
@@ -42,8 +42,4 @@ class Lobby:
                 raise ProtocolError("ready must be boolean")
             self.players[player_id]["ready"] = payload["ready"]
             return None
-        if kind == "start_match":
-            host = self.players[player_id]["host"]
-            return "error", {"code": "gameplay_not_implemented" if host else "host_required",
-                             "message": "Online gameplay synchronization is not implemented" if host else "Only the host may start a match"}
         raise ProtocolError("Unsupported lobby request")

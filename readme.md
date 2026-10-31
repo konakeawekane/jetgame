@@ -77,13 +77,17 @@ Ctrl+C in a hosting lobby copies the invitation. Its label distinguishes Interne
 address candidates, the same LAN, and this computer only. Advanced forwarded IPv4
 addresses can still be supplied through networking configuration or the CLI.
 Connections attempt IPv6 before IPv4. Router/firewall reachability is still required.
-Lobbies synchronize participants and Ready state. Network match start deliberately
-reports that gameplay synchronization is not implemented yet. Use `--offline`
+Lobbies synchronize participants and Ready state. Once everyone is ready, the host
+starts the round and each player selects a team and spawns. The host's Rust world
+owns movement, radar, weapons, damage, deaths, respawns, bots, and round completion.
+Clients predict their own flight, reconcile to the host, and interpolate other jets.
+Late joining is supported. Online pause menus do not stop the shared simulation.
+Use `--offline`
 for the original mock joining flow and local bot matches, or `--preview` to fly
 directly. Respawn, End Match, and Simulate Link Loss exercise the local round.
 
-Host map/mode/player-limit choices are reflected in the lobby. They do not yet
-select a different local game mode or level. All four documented control schemes
+Host player limits and team/free-for-all rules apply to online rounds. Alternative
+map entries still use the supplied level. All four documented control schemes
 now operate the aircraft. Master Volume controls synthesized radar warnings;
 Music Volume is reserved for a future music player. VSync applies immediately.
 Settings are not persisted yet. Offline roster entries are placeholders; gameplay HUD
@@ -274,7 +278,7 @@ The UI GPU suite also renders a live flight scene and radar/missile warning scen
 
 Terrain shadow volumes remain a one-time baking task. The forward shader does
 not apply baked shadows yet. Aircraft shadows, textured/per-object materials,
-richer effects, asset streaming, recorded sound effects/music, networked gameplay,
+richer effects, asset streaming, recorded sound effects/music, lag compensation,
 and further gameplay tuning remain. Clouds are outside immediate scope.
 
 Presentation defaults to `AutoNoVsync` with the backend's supported fallback;

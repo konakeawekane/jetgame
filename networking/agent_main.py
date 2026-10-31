@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
+import os
 from pathlib import Path
 import queue
 import sys
@@ -33,12 +34,22 @@ async def run():
 
     def read_commands():
         try:
+            pending = bytearray()
             while True:
-                line = sys.stdin.buffer.readline(MAX_IPC + 1)
-                if not line or len(line) > MAX_IPC:
+                chunk = os.read(sys.stdin.fileno(), 4096)
+                if not chunk:
                     break
-                future = asyncio.run_coroutine_threadsafe(inbox.put(line), loop)
-                future.result(timeout=5)
+                pending.extend(chunk)
+                while b"\n" in pending:
+                    end = pending.index(b"\n") + 1
+                    if end > MAX_IPC:
+                        return
+                    line = bytes(pending[:end])
+                    del pending[:end]
+                    future = asyncio.run_coroutine_threadsafe(inbox.put(line), loop)
+                    future.result(timeout=5)
+                if len(pending) > MAX_IPC:
+                    break
         except (OSError, RuntimeError, concurrent.futures.TimeoutError):
             pass
         finally:
@@ -51,8 +62,10 @@ async def run():
                 line = output.get()
                 if line is None:
                     return
-                sys.stdout.buffer.write(line)
-                sys.stdout.buffer.flush()
+                remaining = memoryview(line)
+                while remaining:
+                    count = os.write(sys.stdout.fileno(), remaining)
+                    remaining = remaining[count:]
         except OSError:
             with contextlib.suppress(RuntimeError):
                 loop.call_soon_threadsafe(stopped.set)

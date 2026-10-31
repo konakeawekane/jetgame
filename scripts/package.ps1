@@ -54,5 +54,5 @@ try {
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outputPath 'networking.json') -Encoding UTF8
     Copy-Item -LiteralPath (Join-Path $projectRoot 'game.json') -Destination $outputPath
     Copy-Item -LiteralPath (Join-Path $projectRoot 'readme.md') -Destination $outputPath
-    Write-Output "Bundle created at $outputPath with LAN discovery and invitation joining. Online flight replication remains unfinished."
+    Write-Output "Bundle created at $outputPath with LAN discovery, invitation joining, and host-authoritative gameplay over TCP/UDP."
 } finally { Pop-Location }

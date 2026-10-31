@@ -5,12 +5,14 @@ from collections import deque
 import contextlib
 from dataclasses import replace
 import logging
+import secrets
 import socket
 import time
 from .config import NetworkSettings
 from .discovery import advertise
 from .lobby import Lobby
 from .links import invitation
+from .realtime import GameRelay, integer
 from .protocol import ProtocolError, receive, send
 
 LOG = logging.getLogger(__name__)
@@ -29,6 +31,11 @@ class MatchServer:
         self.discovery_warning = ""
         self.port = 0
         self.local_endpoint = ""
+        self.slots = {}
+        self.game = None
+        self.preparing = 0
+        self.epoch_counter = secrets.randbits(32) or 1
+        self.on_inputs = None
 
     @property
     def admin_token(self):
@@ -71,7 +78,91 @@ class MatchServer:
 
     def listing(self):
         return {"id": self.lobby.id, "name": self.lobby.name, "port": self.port,
-                "players": len(self.lobby.players), "max_players": self.lobby.max_players}
+                "players": len(self.lobby.players), "max_players": self.lobby.max_players,
+                "in_progress": self.game is not None}
+
+    def participants(self):
+        return [{"id": key, "slot": self.slots[key], "name": player["name"]} for key, player in self.lobby.players.items()]
+
+    async def send_all(self, kind, payload):
+        async def one(writer):
+            try:
+                await send(writer, kind, payload)
+            except (OSError, TimeoutError):
+                writer.close()
+        await asyncio.gather(*(one(writer) for writer in list(self.clients.values())))
+
+    async def participant_update(self):
+        if self.game:
+            await self.send_all("participants", {"epoch": self.game.setup["epoch"], "players": self.participants()})
+
+    async def prepare(self, player):
+        writer = self.clients[player]
+        if not self.lobby.players[player]["host"]:
+            await send(writer, "error", {"code": "host_required", "message": "Only the host may start a match"})
+        elif self.game or self.preparing:
+            await send(writer, "error", {"message": "A match is already starting or running"})
+        elif not all(p["ready"] for p in self.lobby.players.values()):
+            await send(writer, "error", {"message": "All players must be ready"})
+        else:
+            self.epoch_counter = (self.epoch_counter + 1) % 2**32 or 1
+            self.preparing = self.epoch_counter
+            await send(writer, "prepare", {"epoch": self.preparing, "players": self.participants(),
+                                          "capacity": self.lobby.max_players, "free_for_all": self.lobby.mode == "FREE FOR ALL"})
+
+    async def begin(self, setup):
+        if not isinstance(setup, dict) or setup.get("epoch") != self.preparing or not self.preparing or setup.get("capacity") != self.lobby.max_players:
+            raise ProtocolError("Match preparation is stale")
+        sync, rules = setup.get("sync"), setup.get("rules")
+        if not isinstance(sync, dict) or not isinstance(rules, dict) or not integer(rules.get("physics_hz"), 30, 240) or not integer(rules.get("bot_count"), 0, 15) or not integer(rules.get("max_projectiles"), 1, 256):
+            raise ProtocolError("Invalid gameplay settings")
+        for key, low, high in (("max_packet_bytes", 512, 1200), ("actor_chunk", 1, 8), ("projectile_chunk", 1, 32), ("input_hz", 5, 30), ("snapshot_hz", 5, 30)):
+            if not integer(sync.get(key), low, high):
+                raise ProtocolError("Invalid synchronization settings")
+        relay = GameRelay(self, setup, self.on_inputs)
+        try:
+            await relay.start()
+        except OSError:
+            self.preparing = 0
+            raise ProtocolError("Gameplay UDP port is unavailable") from None
+        self.game = relay
+        self.preparing = 0
+        for player in list(self.clients):
+            await self.start_client(player)
+
+    async def start_client(self, player):
+        if self.game and player in self.clients:
+            await send(self.clients[player], "game_started", {"setup": self.game.setup, "players": self.participants(),
+                        "udp_key": self.game.credential(player)})
+
+    async def game_action(self, player, payload):
+        if not self.game:
+            return
+        if set(payload) != {"epoch", "action", "action_id", "team"} or not integer(payload["epoch"], 1, 2**32 - 1) or payload["action"] not in ("spawn", "respawn", "end") or not integer(payload["action_id"], 1, 2**32 - 1) or not integer(payload["team"], 0, 1):
+            raise ProtocolError("Invalid gameplay action")
+        if payload["epoch"] != self.game.setup["epoch"]:
+            return
+        if payload["action"] == "end" and not self.lobby.players[player]["host"]:
+            await send(self.clients[player], "error", {"message": "Only the host may end the match"})
+            return
+        host = next((key for key, p in self.lobby.players.items() if p["host"]), None)
+        if host in self.clients:
+            await send(self.clients[host], "action", {"epoch": self.game.setup["epoch"], "player": player, **payload})
+
+    async def action_result(self, epoch, player, action_id, accepted, reason):
+        if self.game and epoch == self.game.setup["epoch"] and player in self.clients:
+            await send(self.clients[player], "action_result", {"epoch": self.game.setup["epoch"], "action_id": action_id,
+                        "accepted": accepted, "reason": str(reason)[:160]})
+
+    async def return_lobby(self):
+        if self.game:
+            self.game.close()
+            self.game = None
+        self.preparing = 0
+        for player in self.lobby.players.values():
+            player["ready"] = player["host"]
+        await self.send_all("returned_lobby", {})
+        await self.broadcast()
 
     async def invitation(self):
         families = {server.sockets[0].family for server in self.servers}
@@ -104,9 +195,13 @@ class MatchServer:
             if message["kind"] != "join":
                 raise ProtocolError("Join handshake required")
             player_id = self.lobby.join(message["payload"])
+            self.slots[player_id] = next(slot for slot in range(self.lobby.max_players) if slot not in self.slots.values())
             self.clients[player_id] = writer
             await send(writer, "welcome", self.lobby.welcome(player_id), message["request_id"])
             await self.broadcast()
+            if self.game:
+                await self.start_client(player_id)
+                await self.participant_update()
             while True:
                 message = await receive(reader, self.settings.idle_timeout)
                 now = time.monotonic()
@@ -118,6 +213,15 @@ class MatchServer:
                 kind = message["kind"]
                 if kind == "leave":
                     break
+                if kind == "start_match":
+                    await self.prepare(player_id)
+                    continue
+                if kind == "game_action":
+                    await self.game_action(player_id, message["payload"])
+                    continue
+                if kind == "ready" and (self.game or self.preparing):
+                    await send(writer, "error", {"message": "Ready cannot change during a match"})
+                    continue
                 reply = self.lobby.command(player_id, kind, message["payload"])
                 if reply:
                     await send(writer, reply[0], reply[1], message["request_id"])
@@ -129,15 +233,29 @@ class MatchServer:
         except (asyncio.IncompleteReadError, ConnectionError, TimeoutError):
             pass
         finally:
+            was_host = self.lobby.players.get(player_id, {}).get("host", False)
             self.lobby.players.pop(player_id, None)
+            self.slots.pop(player_id, None)
+            if self.game:
+                self.game.peers.pop(player_id, None)
+                if was_host:
+                    self.game.close()
+                    self.game = None
+                    for other in self.clients.values():
+                        if other is not writer:
+                            other.close()
             self.clients.pop(player_id, None)
             writer.close()
             with contextlib.suppress(ConnectionError, TimeoutError):
                 await asyncio.wait_for(writer.wait_closed(), 1)
             await self.broadcast()
+            await self.participant_update()
             self.tasks.discard(task)
 
     async def close(self):
+        if self.game:
+            self.game.close()
+            self.game = None
         if self.discovery:
             self.discovery.close()
             self.discovery = None

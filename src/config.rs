@@ -17,6 +17,7 @@ pub struct GameConfig {
     pub assets: AssetConfig,
     pub rules: MatchRules,
     pub flight: FlightTuning,
+    pub sync: SyncTuning,
 }
 impl Default for GameConfig {
     fn default() -> Self {
@@ -28,6 +29,42 @@ impl Default for GameConfig {
             assets: AssetConfig::default(),
             rules: MatchRules::default(),
             flight: FlightTuning::default(),
+            sync: SyncTuning::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncTuning {
+    pub input_hz: u32,
+    pub snapshot_hz: u32,
+    pub actor_chunk: usize,
+    pub projectile_chunk: usize,
+    pub redundancy_ticks: usize,
+    pub input_buffer_ticks: usize,
+    pub input_timeout: f32,
+    pub interpolation_seconds: f32,
+    pub extrapolation_seconds: f32,
+    pub max_prediction_ticks: usize,
+    pub max_input_queue: usize,
+    pub max_packet_bytes: usize,
+}
+impl Default for SyncTuning {
+    fn default() -> Self {
+        Self {
+            input_hz: 20,
+            snapshot_hz: 20,
+            actor_chunk: 4,
+            projectile_chunk: 24,
+            redundancy_ticks: 12,
+            input_buffer_ticks: 3,
+            input_timeout: 0.25,
+            interpolation_seconds: 0.12,
+            extrapolation_seconds: 0.75,
+            max_prediction_ticks: 256,
+            max_input_queue: 64,
+            max_packet_bytes: 1200,
         }
     }
 }
@@ -142,6 +179,7 @@ impl GameConfig {
     }
     pub fn validate(&self) -> io::Result<()> {
         let r = self.rules;
+        let s = self.sync;
         let positive = [
             r.round_seconds,
             r.health,
@@ -161,7 +199,22 @@ impl GameConfig {
             self.flight.angular_response,
             self.flight.side_damping,
         ];
-        if self.title.is_empty()
+        if !(5..=30).contains(&s.input_hz)
+            || !(5..=30).contains(&s.snapshot_hz)
+            || !(1..=8).contains(&s.actor_chunk)
+            || !(1..=32).contains(&s.projectile_chunk)
+            || s.redundancy_ticks > 32
+            || s.input_buffer_ticks > 12
+            || !(64..=512).contains(&s.max_prediction_ticks)
+            || !(16..=128).contains(&s.max_input_queue)
+            || !(512..=1200).contains(&s.max_packet_bytes)
+            || !(0.05..=0.5).contains(&s.input_timeout)
+            || !(0.05..=0.3).contains(&s.interpolation_seconds)
+            || !(0.1..=1.5).contains(&s.extrapolation_seconds)
+            || r.physics_hz.div_ceil(s.input_hz.max(1)) as usize + s.redundancy_ticks > 64
+            || r.gun_ammo > 1_000_000
+            || r.missiles > 1_000_000
+            || self.title.is_empty()
             || self.title.len() > 128
             || self.window.iter().any(|n| !(320..=16384).contains(n))
             || !(1..=1000).contains(&self.gameplay_fps)

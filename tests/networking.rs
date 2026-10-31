@@ -36,77 +36,251 @@ fn wait(client: &mut NetworkClient, accept: impl Fn(&NetworkEvent) -> bool) -> N
     panic!("Network event deadline exceeded");
 }
 
-#[test]
-#[ignore = "requires Python 3.11+ and local sockets"]
-fn python_agent_hosts_and_joins_without_a_directory() {
-    let mut host = NetworkClient::new(config());
-    host.submit(Request::Host {
-        op: 1,
-        options: HostOptions {
-            name: "PIPE HOST".into(),
-            max_players: 8,
-            map: "WORLD 01".into(),
-            mode: "TEAM DOGFIGHT".into(),
-        },
-    })
-    .unwrap();
-    let (mut endpoint, mut invitation) = (None, None);
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while endpoint.is_none() || invitation.is_none() {
-        for event in host.poll() {
+struct Replica {
+    client: NetworkClient,
+    game: jetgame::game::multiplayer::Multiplayer,
+    world: jetgame::game::World,
+    config: jetgame::config::GameConfig,
+    op: u64,
+    connected: bool,
+    ready: bool,
+    link: Option<String>,
+    endpoint: Option<String>,
+    disconnected: bool,
+}
+impl Replica {
+    fn new(op: u64) -> Self {
+        let mut game_config = jetgame::config::GameConfig::default();
+        game_config.rules.bot_count = 0;
+        game_config.rules.cover_count = 0;
+        game_config.rules.round_seconds = 120.;
+        let world = jetgame::game::World::configured(
+            jetgame::terrain::Terrain::new(
+                &jetgame::rendering::MeshData::default(),
+                glam::Mat4::IDENTITY,
+            ),
+            &game_config,
+        );
+        Self {
+            client: NetworkClient::new(config()),
+            game: Default::default(),
+            world,
+            config: game_config,
+            op,
+            connected: false,
+            ready: false,
+            link: None,
+            endpoint: None,
+            disconnected: false,
+        }
+    }
+    fn send(&mut self, request: Request) {
+        self.game.note_request(&request);
+        self.client.submit(request).unwrap();
+    }
+    fn flush(&mut self) {
+        for request in self.game.take_requests() {
+            self.client.submit(request).unwrap();
+        }
+    }
+    fn pump(&mut self) {
+        for event in self.client.poll() {
+            self.game
+                .handle(&event, &mut self.world, &self.config)
+                .unwrap();
             match event {
-                NetworkEvent::Connected {
-                    info,
-                    endpoint: address,
-                    ..
-                } => {
-                    assert!(info.host);
-                    assert_eq!(info.name, "PIPE HOST");
-                    endpoint = Some(address);
+                NetworkEvent::Connected { endpoint, .. } => {
+                    self.connected = true;
+                    self.endpoint = Some(endpoint);
                 }
                 NetworkEvent::ShareLink { link, scope, .. } => {
-                    assert!(link.starts_with("jetgame://join?"));
                     assert_eq!(scope, LinkScope::Local);
-                    invitation = Some(link);
+                    self.link = Some(link);
                 }
+                NetworkEvent::Lobby { players, .. } => self.ready = players.iter().all(|p| p.ready),
                 NetworkEvent::Error { message, .. } => panic!("{message}"),
+                NetworkEvent::Disconnected { .. } => self.disconnected = true,
                 _ => {}
             }
         }
+        self.flush();
+    }
+    fn step(&mut self, input: &jetgame::flight::FlightInput) {
+        self.pump();
+        self.game
+            .advance(1. / 120., &mut self.world, input, 0, -glam::Vec3::Z, true);
+        self.flush();
+    }
+    fn action(&mut self, id: u32, action: jetgame::game::net_types::GameAction, team: u8) {
+        self.send(Request::Action {
+            op: self.op,
+            epoch: self.game.epoch().unwrap(),
+            action_id: id,
+            action,
+            team,
+        });
+    }
+}
+fn drive(
+    host: &mut Replica,
+    guest: &mut Replica,
+    frames: usize,
+    input: &jetgame::flight::FlightInput,
+) {
+    for _ in 0..frames {
+        host.step(&Default::default());
+        guest.step(input);
+        std::thread::sleep(Duration::from_millis(8));
+    }
+}
+fn wait_pair(
+    host: &mut Replica,
+    guest: &mut Replica,
+    condition: impl Fn(&Replica, &Replica) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !condition(host, guest) {
+        host.pump();
+        guest.pump();
         assert!(
             Instant::now() < deadline,
-            "host must connect and generate an invitation"
+            "connection/match transition timed out"
         );
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(5));
     }
-    let endpoint = endpoint.unwrap();
-    let mut guest = NetworkClient::new(config());
-    guest
-        .submit(Request::Join {
-            op: 2,
-            endpoint: invitation.unwrap(),
-        })
-        .unwrap();
-    let NetworkEvent::Connected { info, .. } =
-        wait(&mut guest, |e| matches!(e, NetworkEvent::Connected { .. }))
-    else {
-        unreachable!()
+}
+#[test]
+#[ignore = "requires Python 3.11+ and local sockets"]
+fn python_udp_gameplay_has_host_authority_prediction_late_join_and_restart() {
+    use jetgame::{
+        flight::{FlightInput, FlightKey},
+        game::net_types::GameAction,
     };
-    assert!(!info.host);
-    guest.submit(Request::Ready { op: 2, ready: true }).unwrap();
-    wait(
-        &mut guest,
-        |e| matches!(e,NetworkEvent::Lobby { players,.. } if players.len()==2 && players.iter().all(|p|p.ready)),
-    );
-    host.submit(Request::Start { op: 1 }).unwrap();
-    wait(
-        &mut host,
-        |e| matches!(e,NetworkEvent::Error { message,.. } if message.contains("not implemented")),
-    );
-    host.submit(Request::Leave).unwrap();
-    wait(&mut guest, |e| {
-        matches!(e, NetworkEvent::Disconnected { .. })
+    let mut host = Replica::new(1);
+    let mut guest = Replica::new(2);
+    host.send(Request::Host {
+        op: 1,
+        options: HostOptions {
+            name: "SYNC HOST".into(),
+            max_players: 4,
+            map: "WORLD 01".into(),
+            mode: "TEAM DOGFIGHT".into(),
+        },
     });
+    wait_pair(&mut host, &mut guest, |h, _| {
+        h.connected && h.link.is_some()
+    });
+    let endpoint = host.endpoint.clone().unwrap();
+    let link = host.link.clone().unwrap();
+    guest.send(Request::Join {
+        op: 2,
+        endpoint: link.clone(),
+    });
+    wait_pair(&mut host, &mut guest, |_, g| g.connected);
+    guest.send(Request::Ready { op: 2, ready: true });
+    wait_pair(&mut host, &mut guest, |h, g| h.ready && g.ready);
+    host.send(Request::Start { op: 1 });
+    wait_pair(&mut host, &mut guest, |h, g| {
+        h.game.is_active() && g.game.is_active()
+    });
+    assert_eq!(guest.world.local_actor, 1);
+    host.action(1, GameAction::Spawn, 0);
+    guest.action(1, GameAction::Spawn, 1);
+    let mut input = FlightInput::default();
+    drive(&mut host, &mut guest, 40, &input);
+    assert!(host.world.actors[0].alive() && host.world.actors[1].alive());
+    assert!(guest.world.actors[1].alive());
+    let position = host.world.actors[1].body.position;
+    input.set(FlightKey::D, true);
+    input.set(FlightKey::Fire, true);
+    drive(&mut host, &mut guest, 100, &input);
+    assert!(host.world.actors[1].body.position.distance(position) > 100.);
+    assert!(
+        host.world.actors[1].stats.shots > 0,
+        "guest fire must execute on the host"
+    );
+    assert!(
+        guest.world.actors[1].gun_ammo < 800,
+        "authoritative ammo must reach the guest"
+    );
+    assert!(
+        guest.world.actors[1]
+            .body
+            .position
+            .distance(host.world.actors[1].body.position)
+            < 100.,
+        "prediction must remain near authority"
+    );
+    host.world.actors[1].health = 64.3;
+    drive(&mut host, &mut guest, 25, &input);
+    assert!((guest.world.actors[1].health - 64.3).abs() < 0.11);
+    guest.game.swap_weapon();
+    drive(&mut host, &mut guest, 35, &input);
+    assert!(host.world.actors[1].missiles < 8);
+    assert!(guest.world.actors[1].missiles < 8);
+    let mut late = Replica::new(3);
+    late.send(Request::Join {
+        op: 3,
+        endpoint: link,
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !late.game.is_active() {
+        host.step(&Default::default());
+        guest.step(&input);
+        late.pump();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert_eq!(late.world.local_actor, 2);
+    for _ in 0..30 {
+        host.step(&Default::default());
+        guest.step(&input);
+        late.step(&Default::default());
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    assert!(
+        late.world.actors[0].alive(),
+        "late join must receive existing aircraft"
+    );
+    late.send(Request::Leave);
+    let old_epoch = host.game.epoch().unwrap();
+    host.send(Request::ReturnLobby {
+        op: 1,
+        epoch: host.game.epoch().unwrap(),
+    });
+    wait_pair(&mut host, &mut guest, |h, g| {
+        !h.game.is_active() && !g.game.is_active()
+    });
+    guest.send(Request::Ready { op: 2, ready: true });
+    wait_pair(&mut host, &mut guest, |h, g| h.ready && g.ready);
+    host.send(Request::Start { op: 1 });
+    wait_pair(&mut host, &mut guest, |h, g| {
+        h.game.is_active() && g.game.is_active()
+    });
+    assert_ne!(host.game.epoch().unwrap(), old_epoch);
+    guest.send(Request::Action {
+        op: 2,
+        epoch: old_epoch,
+        action_id: 999,
+        action: GameAction::Spawn,
+        team: 1,
+    });
+    guest.send(Request::Inputs {
+        op: 2,
+        epoch: old_epoch,
+        first: 1,
+        frames: vec![[0, 0, 0, 550, 1, 0]; 6],
+    });
+    drive(&mut host, &mut guest, 10, &Default::default());
+    assert!(
+        !host.world.actors[1].alive(),
+        "old-round actions must not spawn in the new round"
+    );
+    host.action(1, GameAction::End, 0);
+    drive(&mut host, &mut guest, 20, &Default::default());
+    assert!(host.world.finished && guest.world.finished);
+    host.send(Request::Leave);
+    wait_pair(&mut host, &mut guest, |_, g| g.disconnected);
     assert!(std::net::TcpStream::connect(endpoint).is_err());
 }
 

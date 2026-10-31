@@ -13,8 +13,10 @@ cargo run
 
 Play opens the LAN browser. Refresh queries local hosts; select one and Join.
 Host Match -> Create Lobby starts a Python host and connects its owner. Another
-instance can join, change Ready state, and leave. Network flight replication is
-still pending; Start Match returns an explicit not-implemented response.
+instance can join and mark Ready. Once everyone is ready the host starts the
+round; each player chooses a team and spawns. Players can join a running round.
+The host owns simulation, bots, radar, damage, ammunition, respawns, and results.
+Only the host may end a round. Its report's Continue returns everyone to the lobby.
 Local bot flight remains available with `cargo run -- --preview`; `--offline`
 retains the mock menu flow. Neither offline mode launches Python.
 
@@ -59,7 +61,8 @@ The OS may not report every interface address; an explicit IPv6 address can be s
 An invitation's external address is an unverified candidate, not proof of reachability.
 
 Behind IPv4 NAT, supply the router's public address and forwarded external port.
-For example, forward external TCP 40000 to this computer's TCP 29010, then configure
+For example, forward external **TCP and UDP** 40000 to this computer's TCP and UDP
+29010, then configure
 `YOUR_PUBLIC_ADDRESS:40000` through `public_addresses` or `--public-address`.
 This is an advanced override; there is no address field in the host menu.
 The game cannot infer a router's public IPv4 address
@@ -92,22 +95,80 @@ python networking/server_main.py --port 29010 --no-lan --public-address example.
 
 The standalone process prints readiness and its invitation, then runs until
 interrupted. It uses the same `MatchServer` and transport-independent `Lobby`
-as a game-hosted session. No Rust window/GPU is required to run this lobby host.
+as a game-hosted session. No Rust window/GPU is required to run this lobby host;
+full dedicated flight requires a headless Rust authority runner using the same
+simulation adapter (the Python server does not reimplement plane physics).
 
 `Lobby` owns participant/permission state; `server.py` owns listener/session
 lifecycle; `client.py` owns client sessions and address fallback; `discovery.py`
 owns LAN queries; `links.py` owns invitation parsing/generation. `NetworkService`
-adapts those components to application commands. Future gameplay traffic should
-extend this service while retaining Rust simulation, rather than duplicating the
-flight model in Python. See [architecture.md](../architecture.md).
+adapts those components to application commands. `realtime.py` handles gameplay
+UDP; Rust's `game/multiplayer.rs` coordinates the authoritative or predicting
+simulation. See [architecture.md](../architecture.md).
+
+## Gameplay synchronization
+
+The host's fixed-rate Rust simulation is authoritative. The default physics rate
+is 120 Hz, independent of render frequency and incoming packet rate. Online
+simulation continues through pause/settings/spawn menus, focus loss, and an
+occluded window. Menus clear local controls rather than pausing other players.
+
+Clients sample controls at the physics rate and send input chunks at **20 Hz**.
+By default a chunk contains six new samples plus twelve recent samples for loss
+recovery. Python run-length encodes repeated controls; axes use signed thousandths,
+and fire/weapon selection are absolute states. Sequence numbers deduplicate input.
+The host uses at most one sample per player per physics tick, buffers jitter,
+drops excessive backlog, and stops stale fire. It never accepts client positions,
+damage, ammunition, or client-chosen player IDs.
+
+The host exports state at **20 Hz** through local IPC. Python sends an individualized
+UDP packet to each guest, always including that guest's aircraft and its consumed
+input acknowledgement. Four other aircraft rotate through the packet by default;
+health/life changes take priority over ordinary rotation.
+Poses and game state are quantized integer rows; packets are compressed and kept
+within **1,200 bytes of UDP payload**, including the authentication header/tag.
+The host's local input does not take a round trip through UDP.
+
+Projectile updates prioritize threats to the recipient and new shots. Gun spawns
+are repeated, missiles continue receiving corrections, explosions are repeated,
+and removal tombstones persist for two seconds. Lower-priority visuals may be
+delayed or omitted under a saturated packet budget; authoritative collision and
+damage still occur on the host. This is state trickling, not a full-world
+broadcast every rendered frame.
+
+Guests predict only their own rigid-body flight, restore the host pose, discard
+acknowledged inputs, and replay unacknowledged inputs. Visual correction offsets
+decay smoothly; spawn/death discontinuities snap. Other jets interpolate buffered
+poses, use bounded dead reckoning between sparse updates, and smooth corrections.
+Health, weapons, radar warnings, and round results always come from the host.
+There is no client-side damage authority or lag-compensated hit rewind yet.
+
+`game.json`'s `sync` object configures batching, redundancy, jitter buffering,
+snapshot frequency, entity chunks, interpolation/extrapolation, histories, and
+packet budgets. Online projectiles are capped at 256 and actors at 47 (up to 32
+human slots plus 15 bots). The host sends physics/match settings at round start;
+clients verify their collision-level fingerprint before accepting the session.
+No remote asset paths or executable content are loaded.
+
+TCP reliably carries match preparation/start, slot changes, spawn/respawn actions,
+action results, round return, and lobby messages. Both TCP and UDP use the same
+externally visible invitation port, including when a router maps that port to a
+different internal port. If gameplay UDP remains unavailable, the guest times out
+with a UDP/firewall message rather than silently playing an unsynchronized game.
+
+Each round has a new epoch and each player has a random UDP key negotiated over
+TCP. Datagram authentication rejects off-path spoofing and wrong-round packets;
+local IPC also checks epochs so queued inputs/actions cannot leak into a restart.
+Late joins receive the current setup and stable slot assignments, then receive
+their own state immediately and other aircraft through the regular trickle.
 
 ## Protocol and lifecycle
 
 Network control frames use a four-byte big-endian length followed by UTF-8 JSON,
 at most 65,536 bytes. Version 1 envelopes contain exactly `version`, `kind`,
 `request_id`, and object `payload`. The lobby supports join/welcome, roster,
-ready, ping/pong, leave, and an explicitly unsupported match-start request.
-TCP is selected for lobby control only; real-time gameplay transport is undecided.
+ready, ping/pong, leave, match preparation/start, actions, and round return.
+Gameplay uses a separate bounded UDP channel on the same numeric port.
 
 Application IPC uses JSON lines capped at 65,536 bytes, bounded input/output
 queues, and operation IDs. New operations/canceling a join cancel pending work;
@@ -119,8 +180,9 @@ Rust kills only its owned child if shutdown stalls.
 Listings, links, and remote messages are untrusted. Frame/schema limits, deadlines,
 connection/request caps, and roster validation reduce malformed-input/resource
 risks. The current transport is plaintext and is not a production security
-solution: there is no authenticated encryption, match password feature, or anti-cheat
-yet. A malicious host can lie about a match. No received code/files are executed.
+solution: UDP HMAC tags do not replace authenticated encryption of the TCP key
+exchange. There is no match password feature or protection from a malicious host
+or on-path attacker yet. No received code/files are executed.
 
 ## Packaging and checks
 
@@ -137,6 +199,8 @@ folder. No directory endpoint is needed. An embedded Python distribution is not
 vendored; full packaging still needs testing with the selected distribution.
 
 Tests cover LAN discovery between local hosts, IPv6, IPv4 fallback, strict links,
-framing, roster/permissions, full lobbies, pipe IPC, and shutdown. Multicast tests
+framing, roster/permissions, full lobbies, pipe IPC, UDP/RLE/MTU budgets, spoof
+rejection, prediction, authoritative movement/fire/health/ammo, late joining,
+round restart, and shutdown. Multicast tests
 need permission to use LAN sockets; a loopback-only sandbox will block them.
 Cross-network Internet/CGNAT behavior needs testing on separate real networks.

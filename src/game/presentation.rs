@@ -19,8 +19,8 @@ impl World {
         input: &FlightInput,
         scheme: usize,
     ) -> crate::ui::HudData {
-        let player = &self.actors[0];
-        let player_pose = self.render_body(0);
+        let player = &self.actors[self.local_actor];
+        let player_pose = self.render_body(self.local_actor);
         let project = |point: Vec3| -> Option<[i32; 2]> {
             let projection = camera
                 .view_projection(viewport[0].max(1) as f32 / viewport[1].max(1) as f32)
@@ -40,12 +40,13 @@ impl World {
             crate::ui::to_design(pixel, viewport)
                 .map(|p| [p[0].round() as i32, p[1].round() as i32])
         };
-        let flags = self.audio_flags(0);
+        let flags = self.audio_flags(self.local_actor);
         let targets = self
             .actors
             .iter()
             .enumerate()
-            .skip(1)
+            .filter(|(i, _)| *i != self.local_actor)
+            .filter(|(i, _)| self.enemies(self.local_actor, *i))
             .filter(|(_, a)| a.alive())
             .filter_map(|(i, a)| {
                 let pose = self.render_body(i);

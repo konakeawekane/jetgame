@@ -2,7 +2,7 @@ use crate::{
     audio::RadarAudio,
     config::GameConfig,
     flight::{FlightInput, FlightKey},
-    game::{GameAssets, aim_direction, chase_camera},
+    game::{GameAssets, aim_direction, chase_camera, multiplayer::Multiplayer},
     networking::{NetworkClient, NetworkConfig},
     rendering::{FrameContext, RenderError, Renderer},
     ui::{Screen, SessionEvent, UiController, UiKey},
@@ -73,6 +73,7 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
         ui.enable_networking();
         Some(NetworkClient::new(options.network))
     };
+    let mut multiplayer = Multiplayer::default();
     if let Some(endpoint) = options.connect {
         ui.connect_direct(endpoint);
     }
@@ -84,10 +85,13 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
     let mut previous_frame = start;
     let mut previous_simulation = start;
+    let mut previous_network = start;
     let mut previous_tick = start;
     let mut next_tick = start;
+    let mut next_present = start;
     let mut previous_screen = ui.screen();
     let mut first_spawn = !options.preview;
+    let mut camera_life = world.actors[world.local_actor].life;
     let mut frame_index = 0;
     let mut cursor = [0_f32; 2];
     let mut occluded = false;
@@ -166,7 +170,13 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                                 KeyCode::KeyP | KeyCode::Escape if !event.repeat => {
                                     ui.key(UiKey::Pause);
                                 }
-                                KeyCode::KeyF if !event.repeat => world.swap_weapon(),
+                                KeyCode::KeyF if !event.repeat => {
+                                    if multiplayer.is_active() {
+                                        multiplayer.swap_weapon();
+                                    } else {
+                                        world.swap_weapon();
+                                    }
+                                }
                                 _ => {
                                     if let Some(key) = flight_key(code) {
                                         input.set(key, true);
@@ -217,22 +227,25 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                                     .camera
                                     .eye
                                     .distance(renderer.scene.camera.target)
-                            - world.actors[0].body.position)
+                            - world.actors[world.local_actor].body.position)
                             .normalize();
-                        world.advance(
-                            now.duration_since(previous_simulation).as_secs_f64(),
-                            &input,
-                            ui.settings.control_scheme,
-                            aim,
-                        );
+                        if !multiplayer.is_active() {
+                            world.advance(
+                                now.duration_since(previous_simulation).as_secs_f64(),
+                                &input,
+                                ui.settings.control_scheme,
+                                aim,
+                            );
+                        }
                         previous_simulation = now;
                         // Presentation follows the same interpolated poses as the visible aircraft.
                         chase_camera(
                             &mut renderer.scene.camera,
-                            world.render_body(0),
+                            world.render_body(world.local_actor),
                             frame.delta_time.as_secs_f32().min(0.1),
-                            false,
+                            camera_life != world.actors[world.local_actor].life,
                         );
+                        camera_life = world.actors[world.local_actor].life;
                         assets.sync_scene(&world, &mut renderer.scene);
                         ui.set_hud(world.hud(
                             renderer.scene.camera,
@@ -240,12 +253,18 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                             &input,
                             ui.settings.control_scheme,
                         ));
-                        audio.update(world.audio_flags(0), ui.settings.volume);
+                        audio.update(world.audio_flags(world.local_actor), ui.settings.volume);
                         if world.finished {
                             outcome = Some(SessionEvent::MatchEnded);
-                        } else if !world.actors[0].alive() {
+                        } else if !world.actors[world.local_actor].alive()
+                            && !multiplayer.awaiting_spawn()
+                        {
                             outcome = Some(SessionEvent::AircraftDestroyed);
                         }
+                    }
+                    if multiplayer.is_active() && !ui.is_gameplay() && ui.screen() != Screen::Spawn
+                    {
+                        assets.sync_scene(&world, &mut renderer.scene);
                     }
                     renderer.set_vsync(ui.settings.vsync);
                     match renderer.render_with_ui(&frame, ui.frame()) {
@@ -291,16 +310,72 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                     let delta = now.duration_since(previous_tick);
                     previous_tick = now;
                     ui.tick(delta);
+                    if multiplayer.is_active() {
+                        let size = window.inner_size();
+                        let viewport = [size.width, size.height];
+                        let ray = aim_direction(renderer.scene.camera, input.mouse, viewport);
+                        let aim = (renderer.scene.camera.eye
+                            + ray
+                                * renderer
+                                    .scene
+                                    .camera
+                                    .eye
+                                    .distance(renderer.scene.camera.target)
+                            - world.actors[world.local_actor].body.position)
+                            .normalize_or_zero();
+                        multiplayer.advance(
+                            now.duration_since(previous_network).as_secs_f64(),
+                            &mut world,
+                            &input,
+                            ui.settings.control_scheme,
+                            aim,
+                            ui.is_gameplay() && focused,
+                        );
+                        previous_network = now;
+                        ui.set_hud(world.hud(
+                            renderer.scene.camera,
+                            viewport,
+                            &input,
+                            ui.settings.control_scheme,
+                        ));
+                        if world.finished && !matches!(ui.screen(), Screen::Report | Screen::Lobby)
+                        {
+                            ui.session_event(SessionEvent::MatchEnded);
+                        } else if ui.is_gameplay()
+                            && !world.actors[world.local_actor].alive()
+                            && !multiplayer.awaiting_spawn()
+                        {
+                            ui.session_event(SessionEvent::AircraftDestroyed);
+                        }
+                    } else {
+                        previous_network = now;
+                    }
                     let size = window.inner_size();
+                    let smooth_world = ui.is_gameplay()
+                        || (multiplayer.is_active()
+                            && (ui.screen() == Screen::Pause
+                                || (ui.screen() == Screen::Settings && ui.shows_world())));
                     if !occluded
                         && size.width > 0
                         && size.height > 0
-                        && (ui.is_gameplay() || ui.needs_redraw() || options.smoke_test)
+                        && ((smooth_world && now >= next_present)
+                            || (!smooth_world && ui.needs_redraw())
+                            || options.smoke_test)
                     {
                         window.request_redraw();
+                        next_present = now
+                            + Duration::from_secs_f64(
+                                1. / if smooth_world {
+                                    options.game.gameplay_fps
+                                } else {
+                                    options.game.menu_fps
+                                } as f64,
+                            );
                     }
                     next_tick = now
-                        + Duration::from_secs_f64(if ui.is_gameplay() {
+                        + Duration::from_secs_f64(if multiplayer.is_active() {
+                            1. / options.game.gameplay_fps.max(world.rules.physics_hz) as f64
+                        } else if ui.is_gameplay() {
                             1. / options.game.gameplay_fps as f64
                         } else {
                             1. / options.game.menu_fps as f64
@@ -312,11 +387,30 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
         }
         if let Some(client) = &mut network {
             for event in client.poll() {
+                if !ui.accepts_network_event(&event) {
+                    continue;
+                }
+                let was_active = multiplayer.is_active();
+                if let Err(error) = multiplayer.handle(&event, &mut world, &options.game) {
+                    multiplayer.clear();
+                    ui.session_event(SessionEvent::ConnectionLost(error));
+                    continue;
+                }
+                if !was_active && multiplayer.is_active() {
+                    previous_network = Instant::now();
+                }
                 ui.network_event(event);
             }
             for request in ui.take_network_requests() {
+                multiplayer.note_request(&request);
                 if let Err(error) = client.submit(request) {
                     ui.network_request_failed(error);
+                }
+            }
+            for request in multiplayer.take_requests() {
+                if let Err(error) = client.submit(request) {
+                    multiplayer.clear();
+                    ui.session_event(SessionEvent::ConnectionLost(error));
                 }
             }
         }
@@ -338,22 +432,31 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
             audio.update(0, ui.settings.volume);
             match screen {
                 Screen::Spawn => {
-                    if matches!(previous_screen, Screen::Joining | Screen::Lobby) {
+                    if !multiplayer.is_active()
+                        && matches!(previous_screen, Screen::Joining | Screen::Lobby)
+                    {
                         world.reset(ui.team());
                         first_spawn = true;
-                    } else if previous_screen == Screen::Pause {
+                    } else if !multiplayer.is_active() && previous_screen == Screen::Pause {
                         world.request_respawn();
                     }
                     assets.preview_scene(&mut renderer.scene);
                 }
                 Screen::Gameplay if previous_screen == Screen::Spawn => {
-                    if first_spawn {
+                    if first_spawn && !multiplayer.is_active() {
                         world.reset(ui.team());
                         first_spawn = false;
                     }
-                    world.respawn_player(ui.team());
+                    if !multiplayer.is_active() {
+                        world.respawn_player(ui.team());
+                    }
                     assets.sync_scene(&world, &mut renderer.scene);
-                    chase_camera(&mut renderer.scene.camera, world.actors[0].body, 0., true);
+                    chase_camera(
+                        &mut renderer.scene.camera,
+                        world.actors[world.local_actor].body,
+                        0.,
+                        true,
+                    );
                     let size = window.inner_size();
                     ui.set_hud(world.hud(
                         renderer.scene.camera,
@@ -368,6 +471,7 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
             previous_frame = previous_tick;
             previous_simulation = previous_tick;
             next_tick = previous_tick;
+            next_present = previous_tick;
             previous_screen = screen;
             window.request_redraw();
         }
@@ -386,7 +490,11 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
             window.set_cursor_visible(!should_capture);
             captured = should_capture;
         }
-        if ui.needs_redraw() && !ui.is_gameplay() && !occluded {
+        if ui.needs_redraw()
+            && !ui.is_gameplay()
+            && !occluded
+            && !(multiplayer.is_active() && ui.shows_world())
+        {
             let size = window.inner_size();
             if size.width > 0 && size.height > 0 {
                 window.request_redraw();

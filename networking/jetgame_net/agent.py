@@ -43,6 +43,9 @@ class NetworkService:
         allowed = {"discover": {"cmd", "op"}, "host": {"cmd", "op", "options"},
                    "join": {"cmd", "op", "endpoint"}, "ready": {"cmd", "op", "ready"},
                    "start": {"cmd", "op"}, "leave": {"cmd"}, "shutdown": {"cmd"}}
+        allowed.update({"begin": {"cmd", "op", "setup"}, "inputs": {"cmd", "op", "epoch", "first", "frames"},
+                        "state": {"cmd", "op", "epoch", "snapshot"}, "action": {"cmd", "op", "epoch", "action_id", "action", "team"},
+                        "action_result": {"cmd", "op", "epoch", "player", "action_id", "accepted", "reason"}, "return_lobby": {"cmd", "op", "epoch"}})
         if kind not in allowed or set(command) != allowed[kind] or type(op) is not int or not 0 <= op < 2**64:
             raise ProtocolError("Invalid application command")
         if kind in ("leave", "shutdown"):
@@ -53,6 +56,27 @@ class NetworkService:
             self.op = op
             self.pending = asyncio.create_task(self.begin(command))
         elif self.connection and op == self.op:
+            if kind in ("begin", "state", "action_result", "return_lobby"):
+                if not self.hosted or not self.connection.info["host"]:
+                    raise ProtocolError("Host authority is required")
+                if kind == "begin":
+                    await self.hosted.begin(command["setup"])
+                elif kind == "state":
+                    if self.hosted.game and self.hosted.game.setup["epoch"] == command["epoch"]:
+                        self.hosted.game.publish(command["snapshot"])
+                elif kind == "action_result":
+                    await self.hosted.action_result(command["epoch"], command["player"], command["action_id"], command["accepted"], command["reason"])
+                else:
+                    if self.hosted.game and self.hosted.game.setup["epoch"] == command["epoch"]:
+                        await self.hosted.return_lobby()
+                return
+            if kind == "inputs":
+                if self.connection.game and self.connection.game.epoch == command["epoch"]:
+                    self.connection.game.send_inputs(command["first"], command["frames"])
+                return
+            if kind == "action":
+                await self.connection.send("game_action", {key: command[key] for key in ("epoch", "action", "action_id", "team")})
+                return
             if kind == "ready" and type(command["ready"]) is not bool:
                 raise ProtocolError("Invalid Ready state")
             await self.connection.send("ready" if kind == "ready" else "start_match",
@@ -72,6 +96,7 @@ class NetworkService:
                     raise ProtocolError("Invalid host options")
                 self.hosted = MatchServer(options.get("name", "DOGFIGHT"), options.get("max_players", 8),
                                           options.get("map", "WORLD 01"), options.get("mode", "TEAM DOGFIGHT"), self.settings)
+                self.hosted.on_inputs = lambda **payload: self.emit("inputs", **payload)
                 await self.hosted.start()
                 link, scope = await self.hosted.invitation()
                 address = self.hosted.local_endpoint
@@ -97,7 +122,8 @@ class NetworkService:
         try:
             await self.connection.listen(self.emit)
         except (OSError, ValueError, TimeoutError, asyncio.IncompleteReadError) as error:
-            self.emit("disconnected", reason=str(error)[:160] or "Connection closed")
+            reason = "Host disconnected" if isinstance(error, asyncio.IncompleteReadError) else "Connection timed out" if isinstance(error, TimeoutError) else str(error)[:160]
+            self.emit("disconnected", reason=reason or "Connection closed")
             await self.connection.close()
             self.connection = None
             if self.hosted:

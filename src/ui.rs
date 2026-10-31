@@ -1,5 +1,6 @@
 //! Small screen controller and retained display list. No game/network state lives in widgets.
 
+use crate::game::net_types::GameAction;
 use crate::networking::{
     HostOptions, LinkScope, NetworkEvent, PeerInfo, Request as NetworkRequest, ServerListing,
 };
@@ -304,6 +305,9 @@ pub struct UiController {
     message: String,
     pub quit_requested: bool,
     network_enabled: bool,
+    online_game: bool,
+    game_epoch: u32,
+    action_counter: u32,
     network_operation: u64,
     network_requests: VecDeque<NetworkRequest>,
     server_list: Vec<ServerListing>,
@@ -344,6 +348,9 @@ impl Default for UiController {
             message: String::new(),
             quit_requested: false,
             network_enabled: false,
+            online_game: false,
+            game_epoch: 0,
+            action_counter: 0,
             network_operation: 0,
             network_requests: VecDeque::new(),
             server_list: Vec::new(),
@@ -362,6 +369,27 @@ impl Default for UiController {
 }
 
 impl UiController {
+    pub fn accepts_network_event(&self, event: &NetworkEvent) -> bool {
+        event
+            .operation()
+            .is_none_or(|op| op == self.network_operation)
+    }
+    pub fn shows_world(&self) -> bool {
+        matches!(
+            self.screen,
+            Screen::Gameplay | Screen::Pause | Screen::Spawn | Screen::Report
+        ) || (self.screen == Screen::Settings && self.settings_return == Screen::Pause)
+    }
+    fn game_action(&mut self, action: GameAction) {
+        self.action_counter = self.action_counter.saturating_add(1);
+        self.network_requests.push_back(NetworkRequest::Action {
+            op: self.network_operation,
+            epoch: self.game_epoch,
+            action_id: self.action_counter,
+            action,
+            team: self.team as u8,
+        });
+    }
     pub fn enable_networking(&mut self) {
         self.network_enabled = true;
         self.dirty = true;
@@ -436,6 +464,39 @@ impl UiController {
     }
     pub fn network_event(&mut self, event: NetworkEvent) {
         match event {
+            NetworkEvent::GameStarted { op, setup, .. }
+                if op == self.network_operation && self.session.is_some() =>
+            {
+                self.online_game = true;
+                self.game_epoch = setup.epoch;
+                self.action_counter = 0;
+                self.message.clear();
+                self.session_event(SessionEvent::MatchStarted);
+            }
+            NetworkEvent::ReturnedLobby { op } if op == self.network_operation => {
+                self.online_game = false;
+                self.message.clear();
+                self.go(Screen::Lobby);
+            }
+            NetworkEvent::ActionResult {
+                op,
+                epoch,
+                action_id,
+                accepted,
+                reason,
+                ..
+            } if op == self.network_operation
+                && epoch == self.game_epoch
+                && action_id == self.action_counter =>
+            {
+                if !accepted {
+                    self.message = reason.to_uppercase();
+                    if self.screen == Screen::Gameplay {
+                        self.go(Screen::Spawn);
+                    }
+                    self.dirty = true;
+                }
+            }
             NetworkEvent::Servers { op, servers } if op == self.network_operation => {
                 self.server_list = servers;
                 self.selected_server = self
@@ -617,6 +678,7 @@ impl UiController {
     pub fn session_event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::ConnectionLost(reason) => {
+                self.online_game = false;
                 if self.network_enabled {
                     self.operation();
                     self.network_requests.push_back(NetworkRequest::Leave);
@@ -790,6 +852,7 @@ impl UiController {
     }
 
     fn leave(&mut self) {
+        self.online_game = false;
         if self.network_enabled {
             self.operation();
             self.network_requests.push_back(NetworkRequest::Leave);
@@ -955,14 +1018,42 @@ impl UiController {
                     self.session_event(SessionEvent::MatchStarted);
                 }
             }
-            Action::Spawn | Action::Resume => self.go(Screen::Gameplay),
-            Action::Respawn => self.session_event(SessionEvent::AircraftDestroyed),
-            Action::EndMatch => self.session_event(SessionEvent::MatchEnded),
+            Action::Spawn => {
+                if self.online_game {
+                    self.game_action(GameAction::Spawn);
+                }
+                self.go(Screen::Gameplay);
+            }
+            Action::Resume => self.go(Screen::Gameplay),
+            Action::Respawn => {
+                if self.online_game {
+                    self.game_action(GameAction::Respawn);
+                }
+                self.session_event(SessionEvent::AircraftDestroyed);
+            }
+            Action::EndMatch => {
+                if self.online_game {
+                    self.game_action(GameAction::End);
+                } else {
+                    self.session_event(SessionEvent::MatchEnded);
+                }
+            }
             Action::Disconnect => {
                 self.session_event(SessionEvent::ConnectionLost("SIMULATED LINK LOSS".into()))
             }
             Action::Leave => self.leave(),
             Action::ReportContinue => {
+                if self.online_game {
+                    if self.session.as_ref().is_some_and(|s| s.host) {
+                        self.network_requests
+                            .push_back(NetworkRequest::ReturnLobby {
+                                op: self.network_operation,
+                                epoch: self.game_epoch,
+                            });
+                    }
+                    self.go(Screen::Lobby);
+                    return;
+                }
                 self.go(if self.session.as_ref().is_some_and(|s| s.host) {
                     Screen::Host
                 } else {
@@ -1306,10 +1397,11 @@ impl UiController {
                     );
                 }
                 let host = self.session.as_ref().is_some_and(|s| s.host);
-                paint.button(
+                paint.enabled_button(
                     Rect::new(64., 538., 352., 54.),
                     if ready { "UNREADY" } else { "READY" },
                     Action::Ready,
+                    !self.online_game,
                 );
                 paint.enabled_button(
                     Rect::new(464., 538., 352., 54.),
@@ -1321,7 +1413,7 @@ impl UiController {
                         "PREVIEW MATCH START"
                     },
                     Action::StartMatch,
-                    ready && (!self.network_enabled || host),
+                    ready && (!self.network_enabled || host) && !self.online_game,
                 );
                 paint.button(
                     Rect::new(864., 538., 352., 54.),
@@ -1369,6 +1461,7 @@ impl UiController {
                         action,
                     );
                 }
+                paint.notice(&self.message);
                 paint.text([802., 190.], "AIRCRAFT PREVIEW", 2., CYAN);
                 paint.text([802., 230.], "GUNS + MISSILES EQUIPPED", 1.5, MUTED);
                 if self.message.starts_with("F-16") {
@@ -1515,10 +1608,13 @@ impl UiController {
                 .into_iter()
                 .enumerate()
                 {
-                    paint.button(
+                    paint.enabled_button(
                         Rect::new(468., 190. + i as f32 * 64., 344., 46.),
                         label,
                         action,
+                        action != Action::EndMatch
+                            || !self.online_game
+                            || self.session.as_ref().is_some_and(|s| s.host),
                     );
                 }
             }
@@ -2016,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn network_start_does_not_run_offline_bots_as_fake_multiplayer() {
+    fn network_start_waits_for_setup_and_spawns_through_authority() {
         let mut ui = UiController::default();
         ui.enable_networking();
         ui.session = Some(Session {
@@ -2031,8 +2127,49 @@ mod tests {
             ui.network_requests.back(),
             Some(NetworkRequest::Start { .. })
         ));
-        ui.network_request_failed("Online gameplay synchronization is not implemented".into());
+        ui.network_request_failed("All players must be ready".into());
         assert_eq!(ui.screen(), Screen::Lobby);
+        let config = crate::config::GameConfig::default();
+        ui.network_event(NetworkEvent::GameStarted {
+            op: 0,
+            setup: crate::game::net_types::MatchSetup {
+                epoch: 7,
+                capacity: 2,
+                rules: config.rules,
+                flight: config.flight,
+                sync: config.sync,
+                level_signature: 0,
+                free_for_all: false,
+            },
+            players: vec![],
+        });
+        assert_eq!(ui.screen(), Screen::Spawn);
+        select(&mut ui, Action::Spawn);
+        assert!(matches!(
+            ui.network_requests.back(),
+            Some(NetworkRequest::Action {
+                epoch: 7,
+                action: GameAction::Spawn,
+                action_id: 1,
+                ..
+            })
+        ));
+        ui.network_event(NetworkEvent::ActionResult {
+            op: 0,
+            epoch: 6,
+            action_id: 1,
+            accepted: false,
+            reason: "old round".into(),
+        });
+        assert_eq!(ui.screen(), Screen::Gameplay);
+        ui.network_event(NetworkEvent::ActionResult {
+            op: 0,
+            epoch: 7,
+            action_id: 1,
+            accepted: false,
+            reason: "Respawn cooldown".into(),
+        });
+        assert_eq!(ui.screen(), Screen::Spawn);
     }
 
     #[test]

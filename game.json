@@ -35,6 +35,20 @@
     "respawn_seconds": 5.0,
     "spawn_protection_seconds": 2.0
   },
+  "sync": {
+    "input_hz": 20,
+    "snapshot_hz": 20,
+    "actor_chunk": 4,
+    "projectile_chunk": 24,
+    "redundancy_ticks": 12,
+    "input_buffer_ticks": 3,
+    "input_timeout": 0.25,
+    "interpolation_seconds": 0.12,
+    "extrapolation_seconds": 0.75,
+    "max_prediction_ticks": 256,
+    "max_input_queue": 64,
+    "max_packet_bytes": 1200
+  },
   "flight": {
     "mass": 9000.0,
     "inertia": [35000.0, 65000.0, 90000.0],

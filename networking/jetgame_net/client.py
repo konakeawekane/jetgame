@@ -3,8 +3,10 @@
 import asyncio
 import contextlib
 import socket
+import time
 from .links import endpoint, parse_link, split_endpoint
 from .protocol import ProtocolError, receive, send
+from .realtime import ClientDatagrams
 
 
 async def resolve_candidates(addresses, settings):
@@ -28,6 +30,7 @@ class Connection:
         self.reader, self.writer = reader, writer
         self.info, self.endpoint, self.settings = info, address, settings
         self.write_lock = asyncio.Lock()
+        self.game = None
 
     @classmethod
     async def join(cls, invitation, settings, admin_token=""):
@@ -66,6 +69,8 @@ class Connection:
         async def heartbeat():
             while True:
                 await asyncio.sleep(self.settings.ping_seconds)
+                if self.game and time.monotonic() - self.game.last_state > self.settings.idle_timeout:
+                    raise ProtocolError("Gameplay UDP timed out; allow or forward UDP on the same port as TCP")
                 await self.send("ping")
         ping = asyncio.create_task(heartbeat())
         try:
@@ -77,6 +82,24 @@ class Connection:
                     emit("lobby", players=payload["players"])
                 elif kind == "error":
                     emit("error", message=str(payload.get("message", "Server error"))[:160])
+                elif kind == "game_started":
+                    if self.game:
+                        self.game.close()
+                        await self.game.wait_closed()
+                    if not isinstance(payload.get("setup"), dict) or not isinstance(payload.get("players"), list):
+                        raise ProtocolError("Invalid match start")
+                    if not self.info["host"]:
+                        self.game = await ClientDatagrams.start(self.writer, payload["setup"], self.info["player_id"],
+                                                               payload.get("udp_key"), emit)
+                    emit("game_started", setup=payload["setup"], players=payload["players"])
+                elif kind in ("prepare", "participants", "action", "action_result"):
+                    emit(kind, **payload)
+                elif kind == "returned_lobby":
+                    if self.game:
+                        self.game.close()
+                        await self.game.wait_closed()
+                        self.game = None
+                    emit("returned_lobby")
                 elif kind != "pong":
                     raise ProtocolError("Unsupported server message")
                 if ping.done():
@@ -87,6 +110,10 @@ class Connection:
                 await ping
 
     async def close(self):
+        if self.game:
+            self.game.close()
+            await self.game.wait_closed()
+            self.game = None
         self.writer.close()
         with contextlib.suppress(OSError, TimeoutError):
             await asyncio.wait_for(self.writer.wait_closed(), 1)

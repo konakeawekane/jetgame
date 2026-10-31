@@ -29,6 +29,20 @@ pub struct Terrain {
 }
 
 impl Terrain {
+    /// Compatibility fingerprint of transformed collision geometry; not a security signature.
+    pub fn signature(&self) -> u64 {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for triangle in &self.triangles {
+            for point in [triangle.a, triangle.b, triangle.c] {
+                for value in point.to_array() {
+                    for byte in value.to_bits().to_le_bytes() {
+                        hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+        }
+        hash
+    }
     pub fn new(data: &MeshData, transform: Mat4) -> Self {
         let triangles: Vec<_> = data
             .indices

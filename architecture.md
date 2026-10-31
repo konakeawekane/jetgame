@@ -7,6 +7,9 @@
 | CPU aircraft physics and control conversion | `src/flight.rs` |
 | Match state, fixed ticks, radar, combat, local bots | `src/game.rs` |
 | GPU asset instances, camera, HUD projection | `src/game/presentation.rs` |
+| Host ticks, input history, prediction and interpolation | `src/game/multiplayer.rs` |
+| Quantized world export/import and actor lifecycle | `src/game/replication.rs` |
+| Typed game session/input/state messages | `src/game/net_types.rs` |
 | Static collision geometry | `src/terrain.rs` |
 | Menu/session state and lightweight display lists | `src/ui.rs` |
 | GPU resources and rendering | `src/rendering/` |
@@ -33,9 +36,15 @@ application lifecycle and emits plain events; `agent_main.py` handles pipe IPC.
 The standalone host reuses the same server/model. A dedicated deployment can
 therefore replace orchestration without rewriting discovery or lobby transport.
 
-Full dedicated flight hosting still needs an authoritative Rust simulation runner
-and a defined input/snapshot protocol. Connect that runner to Python's transport
-through an explicit local interface; keep physics in Rust. Prediction,
-reconciliation, ownership, gameplay transport, authentication, and snapshots are
-not implemented by the lobby scaffold. Offline bots are never presented as remote
-players. [Networking details](networking/README.md) describe current behavior and limits.
+`Multiplayer` coordinates the same fixed-tick world for an authoritative host or a
+predicting replica. Slot assignments remain stable across joins/leaves; input
+sequence acknowledgements and match epochs reject duplicates/old-round traffic.
+`replication.rs` converts poses and game state to bounded integer rows. Python's
+`realtime.py` owns UDP authentication, RLE input chunks, state compression, and
+per-client packet budgets. This keeps transport out of the Rust game.
+
+Full dedicated flight hosting still needs a headless Rust runner calling this
+existing simulation adapter and the same Python command/event interface. The
+standalone Python entry point alone is a lobby host; it does not implement plane
+physics. Lag compensation and encrypted control transport remain future work.
+[Networking details](networking/README.md) describe current behavior and limits.
