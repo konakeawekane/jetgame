@@ -1,7 +1,10 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use jetgame::{app::RunOptions, config::GameConfig, networking::NetworkConfig};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let mut options = RunOptions {
         network: NetworkConfig::load_default()?,
@@ -15,8 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match arg.as_str() {
             "--smoke-test" => options.smoke_test = true,
             "--preview" => options.preview = true,
-            "--offline" => options.offline = true,
-            "--python" | "--server-python" => {
+            "--python" => {
                 options.network.python = Some(
                     args.next()
                         .ok_or("--python requires an interpreter path")?
@@ -45,15 +47,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "JetGame [--preview | --offline] [--config game.json] [--mesh FILE.glb] [--smoke-test]\n  [--connect INVITATION_OR_HOST:PORT] [--python PATH] [--host-port PORT]\n  [--public-address HOST:PORT]"
+                    "JetGame [--preview] [--config game.json] [--mesh FILE.glb] [--smoke-test]\n  [--connect INVITATION_OR_HOST:PORT] [--python PATH] [--host-port PORT]\n  [--public-address HOST:PORT]\nOnline play is the default. --preview starts local flight without networking."
                 );
                 return Ok(());
             }
             _ => return Err(format!("Unknown option: {arg}").into()),
         }
     }
-    if options.connect.is_some() && (options.offline || options.preview) {
-        return Err("--connect cannot be combined with --offline or --preview".into());
+    if options.connect.is_some() && options.preview {
+        return Err("--connect cannot be combined with --preview".into());
     }
     if !public_addresses.is_empty() {
         options

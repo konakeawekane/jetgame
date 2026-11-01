@@ -758,7 +758,9 @@ mod tests {
     };
     use glam::Vec2;
     fn world() -> World {
-        World::new(Terrain::new(&MeshData::default(), Mat4::IDENTITY))
+        let mut config = GameConfig::default();
+        config.rules.bot_count = 3;
+        World::configured(Terrain::new(&MeshData::default(), Mat4::IDENTITY), &config)
     }
     #[test]
     fn offline_respawn_keeps_round_statistics() {

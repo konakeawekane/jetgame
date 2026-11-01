@@ -1,4 +1,4 @@
-"""Provisional control transport; not the future real-time gameplay protocol."""
+"""Bounded TCP control frames for discovery-independent lobby and match lifecycle."""
 
 import asyncio
 import json

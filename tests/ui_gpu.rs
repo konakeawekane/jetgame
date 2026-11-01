@@ -1,6 +1,6 @@
 //! Explicit visual check: cargo test --test ui_gpu -- --ignored --nocapture
 
-use std::{fs::File, io::BufWriter, path::Path, sync::mpsc, time::Duration};
+use std::{fs::File, io::BufWriter, path::Path, sync::mpsc};
 
 use jetgame::{
     rendering::{
@@ -249,42 +249,67 @@ fn every_screen_renders_and_keyboard_route_remains_functional() {
     harness.capture(&mut ui, &output, "03_settings");
     keys(&mut ui, &[UiKey::Back, UiKey::Enter]);
     harness.capture(&mut ui, &output, "04_browser");
-    keys(
-        &mut ui,
-        &[
-            UiKey::Down,
-            UiKey::Down,
-            UiKey::Down,
-            UiKey::Down,
-            UiKey::Enter,
-        ],
-    );
+    ui.connect_direct("127.0.0.1:29010".into());
+    let op = ui
+        .take_network_requests()
+        .into_iter()
+        .find_map(|r| {
+            if let jetgame::networking::Request::Join { op, .. } = r {
+                Some(op)
+            } else {
+                None
+            }
+        })
+        .unwrap();
     harness.capture(&mut ui, &output, "05_joining");
-    ui.tick(Duration::from_secs(2));
+    ui.network_event(jetgame::networking::NetworkEvent::Connected {
+        op,
+        endpoint: "127.0.0.1:29010".into(),
+        info: jetgame::networking::SessionInfo {
+            player_id: 1,
+            host: true,
+            name: "VISUAL TEST".into(),
+            max_players: 8,
+            map: "WORLD 01".into(),
+            mode: "TEAM DOGFIGHT".into(),
+            capabilities: vec!["gameplay_v1".into()],
+            players: vec![jetgame::networking::PeerInfo {
+                id: 1,
+                name: "PILOT".into(),
+                host: true,
+                ready: true,
+            }],
+        },
+    });
     harness.capture(&mut ui, &output, "06_lobby");
-    keys(&mut ui, &[UiKey::Enter, UiKey::Down, UiKey::Enter]);
+    keys(&mut ui, &[UiKey::Down, UiKey::Enter]);
+    assert_eq!(ui.screen(), Screen::Lobby);
+    let config = jetgame::config::GameConfig::default();
+    ui.network_event(jetgame::networking::NetworkEvent::GameStarted {
+        op,
+        players: vec![],
+        setup: jetgame::game::net_types::MatchSetup {
+            epoch: 1,
+            capacity: 8,
+            rules: config.rules,
+            flight: config.flight,
+            sync: config.sync,
+            level_signature: 0,
+            free_for_all: false,
+        },
+    });
     harness.capture(&mut ui, &output, "07_spawn");
     keys(&mut ui, &[UiKey::Down, UiKey::Down, UiKey::Enter]);
     let gameplay = harness.capture(&mut ui, &output, "08_gameplay");
     ui.key(UiKey::Pause);
     let pause = harness.capture(&mut ui, &output, "09_pause");
     assert_ne!(gameplay, pause);
-    keys(
-        &mut ui,
-        &[UiKey::Down, UiKey::Down, UiKey::Down, UiKey::Enter],
-    );
+    ui.session_event(jetgame::ui::SessionEvent::MatchEnded);
     harness.capture(&mut ui, &output, "10_report");
     keys(&mut ui, &[UiKey::Enter, UiKey::Back]);
     keys(
         &mut ui,
-        &[
-            UiKey::Down,
-            UiKey::Down,
-            UiKey::Down,
-            UiKey::Down,
-            UiKey::Down,
-            UiKey::Enter,
-        ],
+        &[UiKey::Down, UiKey::Down, UiKey::Down, UiKey::Enter],
     );
     assert_eq!(ui.screen(), Screen::Host);
     harness.capture(&mut ui, &output, "11_host");
@@ -303,11 +328,14 @@ fn every_screen_renders_and_keyboard_route_remains_functional() {
         wgpu::TextureFormat::Rgba8UnormSrgb,
         &root.join("assets"),
     );
-    let (game_assets, mut world) = jetgame::game::GameAssets::load_on(
+    let mut config = jetgame::config::GameConfig::default();
+    config.assets.root = root.join("assets");
+    config.rules.bot_count = 3;
+    let (game_assets, mut world) = jetgame::game::GameAssets::load_configured_on(
         &harness.device,
         &mut harness.assets,
         &root.join("assets/f-16_fighter_jet.glb"),
-        &root.join("assets"),
+        &config,
     )
     .unwrap();
     let input = jetgame::flight::FlightInput::default();
@@ -365,7 +393,6 @@ fn every_screen_renders_and_keyboard_route_remains_functional() {
     ui.set_hud(world.hud(harness.scene.camera, [WIDTH, HEIGHT], &input, 3));
     harness.capture(&mut ui, &output, "14_radar_and_missiles");
     let mut online = UiController::default();
-    online.enable_networking();
     keys(&mut online, &[UiKey::Enter, UiKey::Enter]);
     harness.capture(&mut online, &output, "15_online_browser_empty");
     online.connect_direct("127.0.0.1:29010".into());

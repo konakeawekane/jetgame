@@ -50,9 +50,7 @@ impl NetworkConfig {
             Self::default()
         };
         config.root = root;
-        if let Some(python) =
-            std::env::var_os("JETGAME_PYTHON").or_else(|| std::env::var_os("JETGAME_SERVER_PYTHON"))
-        {
+        if let Some(python) = std::env::var_os("JETGAME_PYTHON") {
             config.python = Some(python.into());
         }
         Ok(config)
@@ -73,7 +71,11 @@ impl NetworkConfig {
     }
     pub(super) fn python_executable(&self) -> io::Result<PathBuf> {
         if let Some(path) = &self.python {
-            return Ok(self.resolve(path));
+            let path = self.resolve(path);
+            if path.parent() == Some(self.root.join("runtime/python").as_path()) {
+                validate_bundled_runtime(&path)?;
+            }
+            return Ok(path);
         }
         let bundled = self.root.join(if cfg!(windows) {
             "runtime/python/python.exe"
@@ -81,16 +83,48 @@ impl NetworkConfig {
             "runtime/python/bin/python3"
         });
         if bundled.is_file() {
+            validate_bundled_runtime(&bundled)?;
             return Ok(bundled);
-        }
-        if cfg!(debug_assertions) {
-            return Ok(if cfg!(windows) { "python" } else { "python3" }.into());
         }
         Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "Networking Python runtime is missing; configure --python or package runtime/python",
+            "Bundled networking Python is missing. Run scripts/setup-runtime.ps1, then launch again",
         ))
     }
+}
+
+fn validate_bundled_runtime(executable: &Path) -> io::Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let folder = executable.parent().unwrap();
+    let stem = std::fs::read_dir(folder)?.filter_map(Result::ok).find_map(|entry| {
+        let name = entry.file_name();
+        let stem = name.to_str()?.strip_suffix("._pth")?;
+        let digits = stem.strip_prefix("python")?;
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| stem.to_owned())
+    }).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
+        "Python runtime is incomplete: missing python*._pth. Extract the entire game ZIP again"))?;
+    for file in [
+        "python3.dll".to_owned(),
+        format!("{stem}.dll"),
+        format!("{stem}.zip"),
+        "vcruntime140.dll".to_owned(),
+        "vcruntime140_1.dll".to_owned(),
+        "_socket.pyd".to_owned(),
+        "_overlapped.pyd".to_owned(),
+        "select.pyd".to_owned(),
+    ] {
+        if !folder.join(&file).is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Python runtime is incomplete: missing {file}. Extract the entire game ZIP again"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -100,5 +134,57 @@ mod tests {
     fn accepts_bom_and_preserves_python_settings() {
         let config = NetworkConfig::from_json(b"\xef\xbb\xbf{\"host_port\":29012}").unwrap();
         assert_eq!(config.settings["host_port"], 29012);
+    }
+
+    #[test]
+    fn missing_bundle_never_falls_back_to_installed_python() {
+        let config = NetworkConfig {
+            root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/no-bundled-python"),
+            ..Default::default()
+        };
+        let error = config.python_executable().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("setup-runtime.ps1"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn incomplete_bundled_runtime_reports_the_missing_dll_before_starting_python() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/runtime-validation")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let folder = root.join("runtime/python");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in [
+            "python.exe",
+            "python314._pth",
+            "python3.dll",
+            "python314.zip",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "_socket.pyd",
+            "_overlapped.pyd",
+            "select.pyd",
+        ] {
+            std::fs::write(folder.join(name), []).unwrap();
+        }
+        let config = NetworkConfig {
+            root,
+            ..Default::default()
+        };
+        let error = config.python_executable().unwrap_err();
+        assert!(error.to_string().contains("python314.dll"));
+        std::fs::write(folder.join("python314.dll"), []).unwrap();
+        assert_eq!(
+            config.python_executable().unwrap(),
+            folder.join("python.exe")
+        );
     }
 }

@@ -144,19 +144,30 @@ fn worker(
             "Python networking agent was not packaged",
         ));
     }
-    let mut command = Command::new(config.python_executable()?);
+    let python = config.python_executable()?;
+    let mut command = Command::new(&python);
     command
+        .current_dir(python.parent().unwrap_or(&config.root))
         .args(["-I", "-u"])
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(if cfg!(debug_assertions) {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let mut agent = Agent(command.spawn()?);
+    let mut agent = Agent(command.spawn().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("Cannot start bundled networking Python: {error}. Restore runtime/python with scripts/setup-runtime.ps1"),
+        )
+    })?);
     let stdout = agent.0.stdout.take().unwrap();
     let (tx, incoming) = mpsc::sync_channel(64);
     std::thread::spawn(move || {

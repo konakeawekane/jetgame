@@ -4,7 +4,6 @@ pub mod context;
 pub mod forward;
 pub mod frame;
 pub mod mesh;
-pub mod shadow_bake;
 pub mod ui_gpu;
 
 use std::{error::Error, path::Path, sync::Arc};

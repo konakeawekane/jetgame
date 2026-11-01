@@ -123,7 +123,7 @@ impl Default for MatchRules {
     fn default() -> Self {
         Self {
             physics_hz: 120,
-            bot_count: 3,
+            bot_count: 0,
             round_seconds: 180.,
             kill_limit: 5,
             max_projectiles: 256,

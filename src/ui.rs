@@ -180,9 +180,8 @@ const CONTROL_SCHEMES: [&str; 4] = [
     "MOUSE / SIMPLE",
 ];
 
-/// Future networking should deliver these events to the controller on the main thread.
+/// Local simulation outcomes and connection failures delivered on the main thread.
 pub enum SessionEvent {
-    Connected { match_in_progress: bool },
     MatchStarted,
     AircraftDestroyed,
     MatchEnded,
@@ -191,7 +190,6 @@ pub enum SessionEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
-    Continue,
     Play,
     Settings,
     Quit,
@@ -224,7 +222,6 @@ enum Action {
     Resume,
     Respawn,
     EndMatch,
-    Disconnect,
     Leave,
     ReportContinue,
 }
@@ -264,7 +261,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             host: false,
-            name: "OFFLINE SESSION".into(),
+            name: "CONNECTING".into(),
             ready: false,
             map: 0,
             mode: 0,
@@ -275,12 +272,6 @@ impl Default for Session {
 
 const MAPS: [&str; 2] = ["WORLD 01", "OPEN SKY (PLACEHOLDER)"];
 const MODES: [&str; 2] = ["TEAM DOGFIGHT", "FREE FOR ALL"];
-
-const SERVERS: [(&str, &str, bool); 3] = [
-    ("VANGUARD TRAINING", "LOBBY      1 / 8       DEMO", false),
-    ("CANYON DOGFIGHT", "IN MATCH   3 / 8       DEMO", true),
-    ("AFTERBURNER", "LOBBY      2 / 16      DEMO", false),
-];
 
 pub struct UiController {
     screen: Screen,
@@ -304,7 +295,7 @@ pub struct UiController {
     hud: HudData,
     message: String,
     pub quit_requested: bool,
-    network_enabled: bool,
+    local_preview: bool,
     online_game: bool,
     game_epoch: u32,
     action_counter: u32,
@@ -314,7 +305,6 @@ pub struct UiController {
     server_page: usize,
     network_roster: Vec<PeerInfo>,
     local_player: u64,
-    network_endpoint: String,
     join_address: String,
     share_link: String,
     share_scope: LinkScope,
@@ -347,7 +337,7 @@ impl Default for UiController {
             hud: HudData::default(),
             message: String::new(),
             quit_requested: false,
-            network_enabled: false,
+            local_preview: false,
             online_game: false,
             game_epoch: 0,
             action_counter: 0,
@@ -357,7 +347,6 @@ impl Default for UiController {
             server_page: 0,
             network_roster: Vec::new(),
             local_player: 0,
-            network_endpoint: String::new(),
             join_address: String::new(),
             share_link: String::new(),
             share_scope: LinkScope::Local,
@@ -390,15 +379,11 @@ impl UiController {
             team: self.team as u8,
         });
     }
-    pub fn enable_networking(&mut self) {
-        self.network_enabled = true;
-        self.dirty = true;
-    }
     pub fn take_network_requests(&mut self) -> VecDeque<NetworkRequest> {
         std::mem::take(&mut self.network_requests)
     }
     pub fn request_paste(&mut self) {
-        if self.network_enabled && (self.screen == Screen::ServerBrowser || self.editing) {
+        if self.screen == Screen::ServerBrowser || self.editing {
             self.paste_requested = true;
         }
     }
@@ -446,7 +431,6 @@ impl UiController {
         self.dirty = true;
     }
     pub fn connect_direct(&mut self, endpoint: String) {
-        self.network_enabled = true;
         let op = self.operation();
         self.session = Some(Session {
             name: "CONNECTING".into(),
@@ -510,12 +494,11 @@ impl UiController {
                 };
                 self.dirty = true;
             }
-            NetworkEvent::Connected { op, info, endpoint }
+            NetworkEvent::Connected { op, info, .. }
                 if op == self.network_operation && self.screen == Screen::Joining =>
             {
                 self.local_player = info.player_id;
                 self.network_roster = info.players;
-                self.network_endpoint = endpoint;
                 self.session = Some(Session {
                     host: info.host,
                     name: info.name,
@@ -555,7 +538,11 @@ impl UiController {
             }
             NetworkEvent::Error { op, message } if op == self.network_operation => {
                 if self.screen == Screen::Joining {
+                    let hosting = self.session.as_ref().is_some_and(|s| s.host);
                     self.leave();
+                    if hosting {
+                        self.go(Screen::Host);
+                    }
                 }
                 self.message = message.to_uppercase();
                 self.dirty = true;
@@ -564,7 +551,9 @@ impl UiController {
                 self.session_event(SessionEvent::ConnectionLost(reason))
             }
             NetworkEvent::WorkerStopped { reason } => {
-                if self.session.is_some() {
+                if self.screen == Screen::Joining {
+                    self.network_request_failed(reason);
+                } else if self.session.is_some() {
                     self.session_event(SessionEvent::ConnectionLost(reason));
                 } else {
                     self.message = reason.to_uppercase();
@@ -576,37 +565,29 @@ impl UiController {
     }
 
     fn browser_rows(&self) -> Vec<(usize, String, String)> {
-        if self.network_enabled {
-            self.server_list
-                .iter()
-                .enumerate()
-                .skip(self.server_page * 3)
-                .take(3)
-                .map(|(i, s)| {
-                    (
-                        i,
-                        s.name.chars().take(26).collect(),
-                        format!(
-                            "{:<10} {:2} / {:2}   {}",
-                            if s.in_progress { "IN MATCH" } else { "LOBBY" },
-                            s.players,
-                            s.max_players,
-                            if s.reachability == "LAN" {
-                                "LAN"
-                            } else {
-                                "UNVERIFIED"
-                            }
-                        ),
-                    )
-                })
-                .collect()
-        } else {
-            SERVERS
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (i, s.0.into(), s.1.into()))
-                .collect()
-        }
+        self.server_list
+            .iter()
+            .enumerate()
+            .skip(self.server_page * 3)
+            .take(3)
+            .map(|(i, s)| {
+                (
+                    i,
+                    s.name.chars().take(26).collect(),
+                    format!(
+                        "{:<10} {:2} / {:2}   {}",
+                        if s.in_progress { "IN MATCH" } else { "LOBBY" },
+                        s.players,
+                        s.max_players,
+                        if s.reachability == "LAN" {
+                            "LAN"
+                        } else {
+                            "UNVERIFIED"
+                        }
+                    ),
+                )
+            })
+            .collect()
     }
     pub fn screen(&self) -> Screen {
         self.screen
@@ -633,6 +614,7 @@ impl UiController {
 
     /// Direct entry to the existing 3D preview for development and smoke tests.
     pub fn start_preview(&mut self) {
+        self.local_preview = true;
         self.session = Some(Session {
             host: true,
             name: "LOCAL PREVIEW".into(),
@@ -661,11 +643,6 @@ impl UiController {
         self.timer += delta.as_secs_f32();
         match self.screen {
             Screen::Splash if self.timer >= 2.0 => self.go(Screen::Start),
-            Screen::Joining if !self.network_enabled && self.timer >= 1.2 => {
-                self.session_event(SessionEvent::Connected {
-                    match_in_progress: SERVERS[self.selected_server].2,
-                })
-            }
             Screen::Joining | Screen::Splash
                 if (previous * 20.) as u32 != (self.timer * 20.) as u32 =>
             {
@@ -679,22 +656,15 @@ impl UiController {
         match event {
             SessionEvent::ConnectionLost(reason) => {
                 self.online_game = false;
-                if self.network_enabled {
-                    self.operation();
-                    self.network_requests.push_back(NetworkRequest::Leave);
-                    self.network_roster.clear();
-                    self.share_link.clear();
-                }
+
+                self.operation();
+                self.network_requests.push_back(NetworkRequest::Leave);
+                self.network_roster.clear();
+                self.share_link.clear();
+
                 self.session = None;
                 self.message = format!("CONNECTION LOST: {}", reason.to_uppercase());
                 self.go(Screen::ServerBrowser);
-            }
-            SessionEvent::Connected { match_in_progress } if self.screen == Screen::Joining => {
-                self.go(if match_in_progress {
-                    Screen::Spawn
-                } else {
-                    Screen::Lobby
-                });
             }
             SessionEvent::MatchStarted if self.session.is_some() => self.go(Screen::Spawn),
             SessionEvent::AircraftDestroyed if self.session.is_some() => self.go(Screen::Spawn),
@@ -703,8 +673,14 @@ impl UiController {
         }
     }
 
-    /// Returns true when the UI consumes the key; future flight input should respect this.
+    /// Returns true when the UI consumes the key before flight input.
     pub fn key(&mut self, key: UiKey) -> bool {
+        if self.screen == Screen::Splash {
+            if key == UiKey::Enter {
+                self.go(Screen::Start);
+            }
+            return true;
+        }
         self.ensure_layout();
         if key == UiKey::Pause {
             match self.screen {
@@ -845,6 +821,7 @@ impl UiController {
             Screen::ServerBrowser => self.go(Screen::Start),
             Screen::Host | Screen::Joining | Screen::Lobby => self.leave(),
             Screen::Pause => self.go(Screen::Gameplay),
+            Screen::Spawn if self.local_preview => self.leave(),
             Screen::Spawn => self.go(Screen::Lobby),
             Screen::Report => self.activate(Action::ReportContinue),
             _ => self.go(Screen::Start),
@@ -852,19 +829,19 @@ impl UiController {
     }
 
     fn leave(&mut self) {
-        self.online_game = false;
-        if self.network_enabled {
-            self.operation();
-            self.network_requests.push_back(NetworkRequest::Leave);
-            self.network_roster.clear();
-            self.share_link.clear();
+        if self.local_preview {
+            self.quit_requested = true;
+            return;
         }
+        self.online_game = false;
+
+        self.operation();
+        self.network_requests.push_back(NetworkRequest::Leave);
+        self.network_roster.clear();
+        self.share_link.clear();
+
         self.session = None;
-        self.message = if self.network_enabled {
-            String::new()
-        } else {
-            "OFFLINE PREVIEW / NO NETWORK CONNECTION".into()
-        };
+        self.message = String::new();
         self.go(Screen::ServerBrowser);
     }
 
@@ -898,13 +875,9 @@ impl UiController {
             return;
         }
         match action {
-            Action::Continue => self.go(Screen::Start),
             Action::Play => {
-                if self.network_enabled {
-                    self.discover();
-                } else {
-                    self.message = "OFFLINE PREVIEW / SIMULATED SERVERS".into();
-                }
+                self.discover();
+
                 self.go(Screen::ServerBrowser);
             }
             Action::Settings => {
@@ -922,11 +895,8 @@ impl UiController {
                 self.dirty = true;
             }
             Action::Refresh => {
-                if self.network_enabled {
-                    self.discover();
-                } else {
-                    self.message = "DEMO LIST REFRESHED / REAL DISCOVERY NOT IMPLEMENTED".into();
-                }
+                self.discover();
+
                 self.dirty = true;
             }
             Action::PreviousPage => {
@@ -940,20 +910,9 @@ impl UiController {
                 self.dirty = true;
             }
             Action::Join => {
-                if self.network_enabled {
-                    if let Some(server) = self.server_list.get(self.selected_server) {
-                        self.connect_direct(server.endpoint.clone());
-                    }
-                    return;
+                if let Some(server) = self.server_list.get(self.selected_server) {
+                    self.connect_direct(server.endpoint.clone());
                 }
-                self.session = Some(Session {
-                    host: false,
-                    name: SERVERS[self.selected_server].0.into(),
-                    ready: false,
-                    max_players: if self.selected_server == 2 { 16 } else { 8 },
-                    ..Default::default()
-                });
-                self.go(Screen::Joining);
             }
             Action::Host => self.go(Screen::Host),
             Action::HostName | Action::JoinAddress => {
@@ -982,43 +941,38 @@ impl UiController {
                     mode: self.host_mode,
                     max_players: [2, 4, 8, 16][self.host_max],
                 });
-                if self.network_enabled {
-                    let options = HostOptions {
-                        name: name.into(),
-                        max_players: [2, 4, 8, 16][self.host_max],
-                        map: MAPS[self.host_map].into(),
-                        mode: MODES[self.host_mode].into(),
-                    };
-                    let op = self.operation();
-                    self.network_requests
-                        .push_back(NetworkRequest::Host { op, options });
-                    self.go(Screen::Joining);
-                } else {
-                    self.go(Screen::Lobby);
-                }
+
+                let options = HostOptions {
+                    name: name.into(),
+                    max_players: [2, 4, 8, 16][self.host_max],
+                    map: MAPS[self.host_map].into(),
+                    mode: MODES[self.host_mode].into(),
+                };
+                let op = self.operation();
+                self.network_requests
+                    .push_back(NetworkRequest::Host { op, options });
+                self.go(Screen::Joining);
             }
             Action::Ready => {
                 if let Some(session) = &mut self.session {
                     session.ready = !session.ready;
-                    if self.network_enabled {
-                        self.network_requests.push_back(NetworkRequest::Ready {
-                            op: self.network_operation,
-                            ready: session.ready,
-                        });
-                    }
+
+                    self.network_requests.push_back(NetworkRequest::Ready {
+                        op: self.network_operation,
+                        ready: session.ready,
+                    });
                 }
                 self.dirty = true;
             }
             Action::StartMatch => {
-                if self.network_enabled {
-                    self.network_requests.push_back(NetworkRequest::Start {
-                        op: self.network_operation,
-                    });
-                } else {
-                    self.session_event(SessionEvent::MatchStarted);
-                }
+                self.network_requests.push_back(NetworkRequest::Start {
+                    op: self.network_operation,
+                });
             }
             Action::Spawn => {
+                if !self.online_game && !self.local_preview {
+                    return;
+                }
                 if self.online_game {
                     self.game_action(GameAction::Spawn);
                 }
@@ -1038,9 +992,6 @@ impl UiController {
                     self.session_event(SessionEvent::MatchEnded);
                 }
             }
-            Action::Disconnect => {
-                self.session_event(SessionEvent::ConnectionLost("SIMULATED LINK LOSS".into()))
-            }
             Action::Leave => self.leave(),
             Action::ReportContinue => {
                 if self.online_game {
@@ -1054,11 +1005,7 @@ impl UiController {
                     self.go(Screen::Lobby);
                     return;
                 }
-                self.go(if self.session.as_ref().is_some_and(|s| s.host) {
-                    Screen::Host
-                } else {
-                    Screen::Lobby
-                });
+                self.leave();
             }
             _ => {}
         }
@@ -1084,22 +1031,14 @@ impl UiController {
         let session_name = self
             .session
             .as_ref()
-            .map_or("OFFLINE SESSION", |s| s.name.as_str());
+            .map_or("CONNECTING", |s| s.name.as_str());
         match self.screen {
             Screen::Splash => {
                 paint.rect(Rect::new(0., 0., 1280., 720.), [0.01, 0.025, 0.05, 0.35]);
                 paint.text([64., 430.], "JETGAME", 7., WHITE);
-                paint.text([68., 500.], "MULTIPLAYER AIR COMBAT", 2., CYAN);
-                paint.button(
-                    Rect::new(68., 570., 400., 52.),
-                    "ENTER / CONTINUE",
-                    Action::Continue,
-                );
-                paint.text([68., 645.], "ENGINE PREVIEW  /  OFFLINE", 1.5, MUTED);
             }
             Screen::Start => {
                 paint.text([64., 110.], "JETGAME", 7., WHITE);
-                paint.text([68., 184.], "TAKE TO THE SKIES", 2., CYAN);
                 for (i, (label, action)) in [
                     ("PLAY", Action::Play),
                     ("SETTINGS", Action::Settings),
@@ -1114,23 +1053,10 @@ impl UiController {
                         action,
                     );
                 }
-                paint.panel(Rect::new(770., 350., 440., 215.));
-                paint.text([796., 378.], "FLIGHT SYSTEMS ONLINE", 2., CYAN);
-                paint.text([796., 424.], "AIRCRAFT SYSTEMS READY", 1.5, WHITE);
-                paint.text(
-                    [796., 458.],
-                    if self.network_enabled {
-                        "HOST OR FIND A MATCH"
-                    } else {
-                        "NETWORK: OFFLINE PREVIEW"
-                    },
-                    1.5,
-                    MUTED,
-                );
-                paint.text([796., 492.], "ALL MENUS AVAILABLE", 1.5, MUTED);
+                paint.notice(&self.message);
             }
             Screen::Settings => {
-                paint.header("SETTINGS", "LEFT / RIGHT TO ADJUST  -  ENTER TO CYCLE");
+                paint.header("SETTINGS");
                 paint.panel(Rect::new(260., 150., 760., 466.));
                 let labels = [
                     format!("MASTER VOLUME     < {:3}% >", self.settings.volume),
@@ -1144,7 +1070,7 @@ impl UiController {
                         if self.settings.vsync { "ON" } else { "OFF" }
                     ),
                     "RESET TO DEFAULTS".into(),
-                    "BACK / KEEP SETTINGS".into(),
+                    "BACK".into(),
                 ];
                 for (i, (label, action)) in labels
                     .iter()
@@ -1164,22 +1090,9 @@ impl UiController {
                         action,
                     );
                 }
-                paint.text(
-                    [280., 630.],
-                    "SETTINGS ARE KEPT FOR THIS SESSION",
-                    1.3,
-                    MUTED,
-                );
             }
             Screen::ServerBrowser => {
-                paint.header(
-                    "SERVER BROWSER",
-                    if self.network_enabled {
-                        "LAN MATCHES / OR JOIN WITH AN INVITATION"
-                    } else {
-                        "OFFLINE PREVIEW  /  SELECT A SERVER, THEN JOIN"
-                    },
-                );
+                paint.header("SERVER BROWSER");
                 paint.panel(Rect::new(64., 154., 1152., 320.));
                 paint.text([90., 179.], "SERVER", 1.5, CYAN);
                 paint.text([578., 179.], "STATUS     PLAYERS     NETWORK", 1.5, CYAN);
@@ -1190,47 +1103,47 @@ impl UiController {
                     }
                     paint.button(Rect::new(84., y, 1112., 58.), name, Action::Server(*i));
                 }
-                if self.network_enabled && self.server_list.is_empty() {
+                if self.server_list.is_empty() {
                     paint.text([94., 270.], "NO MATCHES FOUND", 2., MUTED);
                 }
-                if self.network_enabled && self.server_list.len() > 3 {
+                if self.server_list.len() > 3 {
                     paint.button(Rect::new(1010., 170., 80., 30.), "<", Action::PreviousPage);
                     paint.button(Rect::new(1110., 170., 80., 30.), ">", Action::NextPage);
                 }
-                if self.network_enabled {
-                    let tail: String = self
-                        .join_address
-                        .chars()
-                        .rev()
-                        .take(65)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect();
-                    paint.button(
-                        Rect::new(64., 454., 756., 44.),
-                        &format!(
-                            "ADDRESS: {tail}{}",
-                            if self.editing && self.edit_target == Action::JoinAddress {
-                                "_"
-                            } else {
-                                ""
-                            }
-                        ),
-                        Action::JoinAddress,
-                    );
-                    paint.button(
-                        Rect::new(838., 454., 174., 44.),
-                        "PASTE",
-                        Action::PasteAddress,
-                    );
-                    paint.enabled_button(
-                        Rect::new(1030., 454., 186., 44.),
-                        "CONNECT",
-                        Action::ConnectAddress,
-                        !self.join_address.trim().is_empty(),
-                    );
-                }
+
+                let tail: String = self
+                    .join_address
+                    .chars()
+                    .rev()
+                    .take(65)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                paint.button(
+                    Rect::new(64., 454., 756., 44.),
+                    &format!(
+                        "ADDRESS: {tail}{}",
+                        if self.editing && self.edit_target == Action::JoinAddress {
+                            "_"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Action::JoinAddress,
+                );
+                paint.button(
+                    Rect::new(838., 454., 174., 44.),
+                    "PASTE",
+                    Action::PasteAddress,
+                );
+                paint.enabled_button(
+                    Rect::new(1030., 454., 186., 44.),
+                    "CONNECT",
+                    Action::ConnectAddress,
+                    !self.join_address.trim().is_empty(),
+                );
+
                 for (i, (label, action)) in [
                     ("REFRESH", Action::Refresh),
                     ("JOIN SELECTED", Action::Join),
@@ -1244,45 +1157,24 @@ impl UiController {
                         Rect::new(64. + i as f32 * 294., 516., 270., 54.),
                         label,
                         action,
-                        action != Action::Join
-                            || !self.network_enabled
-                            || !self.server_list.is_empty(),
+                        action != Action::Join || !self.server_list.is_empty(),
                     );
                 }
                 paint.notice(&self.message);
             }
             Screen::Joining => {
-                paint.header(
-                    "JOINING MATCH",
-                    if self.network_enabled {
-                        "CONNECTING TO SERVER"
-                    } else {
-                        "OFFLINE PREVIEW / CONNECTING TO A SIMULATED SESSION"
-                    },
-                );
+                paint.header("CONNECTING");
                 paint.panel(Rect::new(260., 230., 760., 240.));
                 paint.text([294., 263.], session_name, 2., WHITE);
-                paint.text([294., 310.], "ESTABLISHING SESSION...", 1.5, MUTED);
                 paint.rect(Rect::new(294., 352., 690., 8.), BORDER);
                 paint.rect(
-                    if self.network_enabled {
-                        Rect::new(294. + 600. * (self.timer * 0.4).fract(), 352., 90., 8.)
-                    } else {
-                        Rect::new(294., 352., 690. * (self.timer / 1.2).min(1.), 8.)
-                    },
+                    Rect::new(294. + 600. * (self.timer * 0.4).fract(), 352., 90., 8.),
                     CYAN,
                 );
                 paint.button(Rect::new(448., 395., 384., 48.), "CANCEL", Action::Leave);
             }
             Screen::Host => {
-                paint.header(
-                    "HOST MATCH",
-                    if self.network_enabled {
-                        "CONFIGURE YOUR SERVER"
-                    } else {
-                        "CONFIGURE AN OFFLINE PREVIEW SESSION"
-                    },
-                );
+                paint.header("HOST MATCH");
                 paint.panel(Rect::new(260., 150., 760., 470.));
                 let cursor = if self.editing && self.edit_target == Action::HostName {
                     "_"
@@ -1294,11 +1186,7 @@ impl UiController {
                     format!("MODE: < {} >", MODES[self.host_mode]),
                     format!("MAP: < {} >", MAPS[self.host_map]),
                     format!("PLAYER LIMIT: < {} >", [2, 4, 8, 16][self.host_max]),
-                    if self.network_enabled {
-                        "CREATE LOBBY".into()
-                    } else {
-                        "CREATE PREVIEW LOBBY".into()
-                    },
+                    "CREATE LOBBY".into(),
                     "CANCEL".into(),
                 ];
                 let actions = [
@@ -1316,65 +1204,40 @@ impl UiController {
                         action,
                     );
                 }
-                paint.text(
-                    [290., 634.],
-                    "ENTER TO EDIT / CTRL+V TO PASTE / ENTER TO FINISH",
-                    1.2,
-                    MUTED,
-                );
+                paint.notice(&self.message);
             }
             Screen::Lobby => {
-                paint.header("WAITING LOBBY", session_name);
+                paint.header(session_name);
                 paint.panel(Rect::new(64., 160., 1152., 340.));
-                paint.text([94., 188.], "PILOT ROSTER", 2., CYAN);
                 let ready = self.session.as_ref().is_some_and(|s| s.ready);
-                if self.network_enabled {
-                    for (i, player) in self.network_roster.iter().take(8).enumerate() {
-                        let name: String = player.name.chars().take(20).collect();
-                        let prefix = if player.id == self.local_player {
-                            "YOU / "
-                        } else {
-                            ""
-                        };
-                        paint.text(
-                            [94., 236. + i as f32 * 28.],
-                            &format!("{prefix}{name}"),
-                            1.5,
-                            WHITE,
-                        );
-                        paint.text(
-                            [470., 236. + i as f32 * 28.],
-                            if player.ready { "READY" } else { "NOT READY" },
-                            1.5,
-                            if player.ready { CYAN } else { MUTED },
-                        );
-                    }
-                    if self.network_roster.len() > 8 {
-                        paint.text(
-                            [94., 470.],
-                            &format!("+ {} MORE PILOTS", self.network_roster.len() - 8),
-                            1.5,
-                            MUTED,
-                        );
-                    }
-                    paint.text([782., 244.], "CONNECTED", 2., CYAN);
-                    let endpoint: String = self.network_endpoint.chars().take(36).collect();
-                    paint.text([782., 294.], &endpoint, 1.2, MUTED);
-                } else {
+
+                for (i, player) in self.network_roster.iter().take(8).enumerate() {
+                    let name: String = player.name.chars().take(20).collect();
+                    let prefix = if player.id == self.local_player {
+                        "YOU / "
+                    } else {
+                        ""
+                    };
                     paint.text(
-                        [94., 244.],
-                        if ready {
-                            "YOU                 READY"
-                        } else {
-                            "YOU                 NOT READY"
-                        },
-                        2.,
+                        [94., 236. + i as f32 * 28.],
+                        &format!("{prefix}{name}"),
+                        1.5,
                         WHITE,
                     );
-                    paint.text([94., 294.], "WINGMAN             PLACEHOLDER", 1.5, MUTED);
-                    paint.text([94., 338.], "OPPONENT            PLACEHOLDER", 1.5, MUTED);
-                    paint.text([782., 244.], "OFFLINE SESSION", 2., CYAN);
-                    paint.text([782., 294.], "NO REAL PLAYERS CONNECTED", 1.5, MUTED);
+                    paint.text(
+                        [470., 236. + i as f32 * 28.],
+                        if player.ready { "READY" } else { "NOT READY" },
+                        1.5,
+                        if player.ready { CYAN } else { MUTED },
+                    );
+                }
+                if self.network_roster.len() > 8 {
+                    paint.text(
+                        [94., 470.],
+                        &format!("+ {} MORE PILOTS", self.network_roster.len() - 8),
+                        1.5,
+                        MUTED,
+                    );
                 }
                 if let Some(session) = &self.session {
                     paint.text(
@@ -1405,44 +1268,37 @@ impl UiController {
                 );
                 paint.enabled_button(
                     Rect::new(464., 538., 352., 54.),
-                    if self.network_enabled {
-                        if host { "START MATCH" } else { "AWAITING HOST" }
-                    } else if host {
-                        "START MATCH PREVIEW"
-                    } else {
-                        "PREVIEW MATCH START"
-                    },
+                    if host { "START MATCH" } else { "AWAITING HOST" },
                     Action::StartMatch,
-                    ready && (!self.network_enabled || host) && !self.online_game,
+                    ready && host && !self.online_game,
                 );
                 paint.button(
                     Rect::new(864., 538., 352., 54.),
                     "LEAVE LOBBY",
                     Action::Leave,
                 );
-                if self.network_enabled {
-                    if !self.share_link.is_empty() {
-                        paint.text(
-                            [782., 438.],
-                            match self.share_scope {
-                                LinkScope::Internet => "LINK: INTERNET ADDRESS",
-                                LinkScope::Lan => "LINK: SAME NETWORK",
-                                LinkScope::Local => "LINK: THIS COMPUTER ONLY",
-                            },
-                            1.1,
-                            MUTED,
-                        );
-                        paint.button(
-                            Rect::new(782., 458., 400., 34.),
-                            "COPY JOIN LINK",
-                            Action::CopyLink,
-                        );
-                    }
-                    paint.notice(&self.message);
+
+                if !self.share_link.is_empty() {
+                    paint.text(
+                        [782., 438.],
+                        match self.share_scope {
+                            LinkScope::Internet => "LINK: INTERNET ADDRESS",
+                            LinkScope::Lan => "LINK: SAME NETWORK",
+                            LinkScope::Local => "LINK: THIS COMPUTER ONLY",
+                        },
+                        1.1,
+                        MUTED,
+                    );
+                    paint.button(
+                        Rect::new(782., 458., 400., 34.),
+                        "COPY JOIN LINK",
+                        Action::CopyLink,
+                    );
                 }
+                paint.notice(&self.message);
             }
             Screen::Spawn => {
-                paint.header("AIRCRAFT DEPLOYMENT", "SELECT YOUR TEAM");
+                paint.header("SPAWN");
                 paint.panel(Rect::new(64., 160., 536., 414.));
                 let labels = [
                     format!("TEAM: < {} >", ["BLUE", "ORANGE"][self.team]),
@@ -1462,17 +1318,14 @@ impl UiController {
                     );
                 }
                 paint.notice(&self.message);
-                paint.text([802., 190.], "AIRCRAFT PREVIEW", 2., CYAN);
-                paint.text([802., 230.], "GUNS + MISSILES EQUIPPED", 1.5, MUTED);
-                if self.message.starts_with("F-16") {
-                    paint.notice(&self.message);
-                }
             }
             Screen::Gameplay => {
                 let hud = &self.hud;
                 paint.panel(Rect::new(474., 54., 324., 38.));
-                paint.panel(Rect::new(450., 668., 470., 38.));
                 paint.text([32., 28.], "F-16", 2., WHITE);
+                if self.local_preview {
+                    paint.text([32., 58.], "OFFLINE PREVIEW", 1.2, CYAN);
+                }
                 paint.text(
                     [940., 28.],
                     &format!(
@@ -1590,19 +1443,16 @@ impl UiController {
                         [1., 0.45, 0.05, 1.],
                     );
                 }
-                paint.text([460., 680.], "F WEAPON   SPACE FIRE   P PAUSE", 1.2, WHITE);
             }
             Screen::Pause => {
                 paint.rect(Rect::new(0., 0., 1280., 720.), [0.005, 0.01, 0.025, 0.7]);
                 paint.panel(Rect::new(440., 90., 400., 516.));
                 paint.text([480., 116.], "PAUSE MENU", 3., WHITE);
-                paint.text([480., 150.], "P / RESUME", 1., MUTED);
                 for (i, (label, action)) in [
                     ("RESUME", Action::Resume),
                     ("SETTINGS", Action::Settings),
                     ("RESPAWN", Action::Respawn),
                     ("END MATCH", Action::EndMatch),
-                    ("SIMULATE LINK LOSS", Action::Disconnect),
                     ("LEAVE MATCH", Action::Leave),
                 ]
                 .into_iter()
@@ -1620,9 +1470,8 @@ impl UiController {
             }
             Screen::Report => {
                 paint.rect(Rect::new(0., 0., 1280., 720.), [0.005, 0.01, 0.025, 0.75]);
-                paint.header("MATCH REPORT", "AFTER ACTION REPORT");
+                paint.header("MATCH REPORT");
                 paint.panel(Rect::new(240., 180., 800., 330.));
-                paint.text([280., 220.], "MISSION COMPLETE", 3., CYAN);
                 paint.text(
                     [280., 288.],
                     "PILOT           KILLS     DEATHS     SCORE",
@@ -1657,14 +1506,6 @@ impl UiController {
                     Action::Leave,
                 );
             }
-        }
-        if self.screen != Screen::Gameplay {
-            paint.text(
-                [64., 688.],
-                "ARROWS  NAVIGATE / ADJUST     ENTER  SELECT     ESC  BACK",
-                1.2,
-                MUTED,
-            );
         }
         if !paint.widgets.is_empty() {
             self.focused = self.focused.min(paint.widgets.len() - 1);
@@ -1784,13 +1625,23 @@ impl Painter {
         }
         self.rect(Rect::new(0., 0., 1280., 7.), CYAN);
     }
-    fn header(&mut self, title: &str, subtitle: &str) {
+    fn header(&mut self, title: &str) {
         self.text([64., 46.], title, 4., WHITE);
-        self.text([66., 100.], subtitle, 1.5, CYAN);
     }
     fn notice(&mut self, message: &str) {
-        let message: String = message.chars().take(106).collect();
-        self.text([66., 616.], &message, 1.3, [0.85, 0.6, 0.17, 1.]);
+        if message.is_empty() {
+            return;
+        }
+        let message: String = message.chars().take(190).collect();
+        let split = message
+            .char_indices()
+            .nth(95)
+            .map_or(message.len(), |(i, _)| i);
+        let (first, remaining) = message.split_at(split);
+        self.text([66., 642.], first, 1.3, [0.85, 0.6, 0.17, 1.]);
+        if !remaining.is_empty() {
+            self.text([66., 663.], remaining, 1.3, [0.85, 0.6, 0.17, 1.]);
+        }
     }
     fn button(&mut self, rect: Rect, label: &str, action: Action) {
         self.enabled_button(rect, label, action, true);
@@ -1810,9 +1661,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn splash_has_no_controls_and_advances_automatically_or_skips_with_enter() {
+        let mut ui = UiController::default();
+        ui.ensure_layout();
+        assert!(ui.widgets.is_empty());
+        ui.tick(Duration::from_secs(2));
+        assert_eq!(ui.screen(), Screen::Start);
+        let mut ui = UiController::default();
+        ui.key(UiKey::Enter);
+        assert_eq!(ui.screen(), Screen::Start);
+    }
+
+    #[test]
+    fn hosting_failure_preserves_configuration_and_allows_retry_into_lobby() {
+        let mut ui = UiController::default();
+        ui.go(Screen::Host);
+        ui.host_name = "MY MATCH".into();
+        select(&mut ui, Action::Create);
+        let old_op = ui.network_operation;
+        ui.network_request_failed("Address is already in use".into());
+        assert_eq!(ui.screen(), Screen::Host);
+        assert_eq!(ui.host_name, "MY MATCH");
+        assert!(ui.message.contains("ADDRESS IS ALREADY IN USE"));
+        connected(&mut ui, true); // No pending connection: cannot reopen the lobby.
+        assert_eq!(ui.screen(), Screen::Host);
+        select(&mut ui, Action::Create);
+        assert!(ui.network_operation > old_op);
+        connected(&mut ui, true);
+        assert_eq!(ui.screen(), Screen::Lobby);
+    }
+
+    #[test]
+    fn missing_runtime_while_hosting_keeps_the_host_screen_and_error() {
+        let mut ui = UiController::default();
+        ui.go(Screen::Host);
+        select(&mut ui, Action::Create);
+        ui.network_event(NetworkEvent::WorkerStopped {
+            reason: "Python unavailable".into(),
+        });
+        assert_eq!(ui.screen(), Screen::Host);
+        assert!(ui.message.contains("PYTHON UNAVAILABLE"));
+        assert!(ui.session.is_none());
+    }
+
+    #[test]
     fn guests_can_paste_links_and_hosts_do_not_need_an_address() {
         let mut ui = UiController::default();
-        ui.enable_networking();
         ui.go(Screen::ServerBrowser);
         let link = "jetgame://join?v=1&endpoint=Example.net%3A29010";
         ui.paste_text(link);
@@ -1834,7 +1728,6 @@ mod tests {
     #[test]
     fn invitation_copy_is_cleared_when_the_connection_is_lost() {
         let mut ui = UiController::default();
-        ui.enable_networking();
         ui.go(Screen::Lobby);
         ui.network_event(NetworkEvent::ShareLink {
             op: 0,
@@ -1873,30 +1766,80 @@ mod tests {
         ui.key(UiKey::Enter);
     }
 
+    fn connected(ui: &mut UiController, host: bool) {
+        ui.network_event(NetworkEvent::Connected {
+            op: ui.network_operation,
+            endpoint: "127.0.0.1:29010".into(),
+            info: crate::networking::SessionInfo {
+                name: "TEST MATCH".into(),
+                player_id: 1,
+                host,
+                max_players: 8,
+                map: MAPS[0].into(),
+                mode: MODES[0].into(),
+                capabilities: vec!["gameplay_v1".into()],
+                players: vec![PeerInfo {
+                    id: 1,
+                    name: "PILOT".into(),
+                    ready: true,
+                    host,
+                }],
+            },
+        });
+    }
+
+    fn started(ui: &mut UiController) {
+        let config = crate::config::GameConfig::default();
+        ui.network_event(NetworkEvent::GameStarted {
+            op: ui.network_operation,
+            setup: crate::game::net_types::MatchSetup {
+                epoch: 1,
+                capacity: 8,
+                rules: config.rules,
+                flight: config.flight,
+                sync: config.sync,
+                level_signature: 0,
+                free_for_all: false,
+            },
+            players: vec![],
+        });
+    }
+
     #[test]
-    fn complete_guest_route_uses_keyboard_navigation_and_pause() {
+    fn default_menu_requires_real_discovery_connection_and_match_start() {
         let mut ui = UiController::default();
         ui.key(UiKey::Enter);
-        assert_eq!(ui.screen(), Screen::Start);
         ui.key(UiKey::Enter);
         assert_eq!(ui.screen(), Screen::ServerBrowser);
-        for _ in 0..4 {
-            ui.key(UiKey::Down);
-        }
-        ui.key(UiKey::Enter);
+        assert!(ui.browser_rows().is_empty());
+        assert!(matches!(
+            ui.take_network_requests().back(),
+            Some(NetworkRequest::Discover { .. })
+        ));
+        assert!(
+            !ui.widgets
+                .iter()
+                .any(|w| w.action == Action::Join && w.enabled)
+        );
+        ui.connect_direct("127.0.0.1:29010".into());
+        ui.tick(Duration::from_secs(30));
         assert_eq!(ui.screen(), Screen::Joining);
-        ui.tick(Duration::from_secs(2));
+        connected(&mut ui, false);
         assert_eq!(ui.screen(), Screen::Lobby);
-        ui.key(UiKey::Enter); // Ready
-        ui.key(UiKey::Down);
-        ui.key(UiKey::Enter); // Start preview
+        ui.tick(Duration::from_secs(30));
+        assert_eq!(ui.screen(), Screen::Lobby);
+        started(&mut ui);
         assert_eq!(ui.screen(), Screen::Spawn);
-        for _ in 0..2 {
-            ui.key(UiKey::Down);
-        }
-        ui.key(UiKey::Enter);
+        select(&mut ui, Action::Spawn);
         assert_eq!(ui.screen(), Screen::Gameplay);
-        assert!(!ui.key(UiKey::Up)); // future flight controls receive unconsumed keys
+        assert!(matches!(
+            ui.network_requests.back(),
+            Some(NetworkRequest::Action {
+                action: GameAction::Spawn,
+                ..
+            })
+        ));
+        assert!(!ui.key(UiKey::Up));
         ui.key(UiKey::Pause);
         assert_eq!(ui.screen(), Screen::Pause);
         ui.key(UiKey::Pause);
@@ -1910,12 +1853,12 @@ mod tests {
     }
 
     #[test]
-    fn joining_an_active_match_goes_directly_to_spawn() {
+    fn late_join_waits_for_authoritative_setup_before_spawn() {
         let mut ui = UiController::default();
-        ui.go(Screen::ServerBrowser);
-        select(&mut ui, Action::Server(1));
-        select(&mut ui, Action::Join);
-        ui.tick(Duration::from_secs(2));
+        ui.connect_direct("127.0.0.1:29010".into());
+        connected(&mut ui, false);
+        assert_eq!(ui.screen(), Screen::Lobby);
+        started(&mut ui);
         assert_eq!(ui.screen(), Screen::Spawn);
     }
 
@@ -1927,11 +1870,45 @@ mod tests {
         assert_eq!(ui.screen(), Screen::ServerBrowser);
         select(&mut ui, Action::Host);
         select(&mut ui, Action::Create);
-        assert!(ui.session.as_ref().unwrap().host);
+        assert_eq!(ui.screen(), Screen::Joining);
+        connected(&mut ui, true);
         select(&mut ui, Action::StartMatch);
+        assert_eq!(ui.screen(), Screen::Lobby);
+        started(&mut ui);
         ui.session_event(SessionEvent::MatchEnded);
         select(&mut ui, Action::ReportContinue);
-        assert_eq!(ui.screen(), Screen::Host);
+        assert_eq!(ui.screen(), Screen::Lobby);
+        assert!(matches!(
+            ui.network_requests.back(),
+            Some(NetworkRequest::ReturnLobby { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_networking_stays_online_and_never_starts_local_gameplay() {
+        let mut ui = UiController::default();
+        ui.connect_direct("127.0.0.1:29010".into());
+        ui.network_event(NetworkEvent::WorkerStopped {
+            reason: "Python unavailable".into(),
+        });
+        ui.tick(Duration::from_secs(30));
+        assert_eq!(ui.screen(), Screen::ServerBrowser);
+        assert!(ui.session.is_none());
+        assert!(!ui.local_preview);
+        assert!(ui.browser_rows().is_empty());
+        assert!(ui.message.contains("PYTHON UNAVAILABLE"));
+    }
+
+    #[test]
+    fn preview_is_explicit_and_leaving_it_exits() {
+        let mut ui = UiController::default();
+        assert!(!ui.local_preview);
+        ui.start_preview();
+        assert_eq!(ui.screen(), Screen::Gameplay);
+        ui.key(UiKey::Pause);
+        select(&mut ui, Action::Leave);
+        assert!(ui.quit_requested);
+        assert!(ui.take_network_requests().is_empty());
     }
 
     #[test]
@@ -2086,7 +2063,6 @@ mod tests {
     #[test]
     fn network_join_waits_for_real_events_and_cancel_ignores_stale_success() {
         let mut ui = UiController::default();
-        ui.enable_networking();
         ui.connect_direct("127.0.0.1:29010".into());
         let old = ui.network_operation;
         ui.tick(Duration::from_secs(10));
@@ -2113,13 +2089,14 @@ mod tests {
 
     #[test]
     fn network_start_waits_for_setup_and_spawns_through_authority() {
-        let mut ui = UiController::default();
-        ui.enable_networking();
-        ui.session = Some(Session {
-            host: true,
-            ready: true,
+        let mut ui = UiController {
+            session: Some(Session {
+                host: true,
+                ready: true,
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         ui.go(Screen::Lobby);
         select(&mut ui, Action::StartMatch);
         assert_eq!(ui.screen(), Screen::Lobby);
@@ -2175,7 +2152,6 @@ mod tests {
     #[test]
     fn network_browser_pages_and_disables_join_when_empty() {
         let mut ui = UiController::default();
-        ui.enable_networking();
         ui.go(Screen::ServerBrowser);
         ui.ensure_layout();
         assert!(

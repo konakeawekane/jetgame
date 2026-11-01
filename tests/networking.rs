@@ -37,6 +37,7 @@ fn wait(client: &mut NetworkClient, accept: impl Fn(&NetworkEvent) -> bool) -> N
 }
 
 struct Replica {
+    ui: Option<jetgame::ui::UiController>,
     client: NetworkClient,
     game: jetgame::game::multiplayer::Multiplayer,
     world: jetgame::game::World,
@@ -51,7 +52,6 @@ struct Replica {
 impl Replica {
     fn new(op: u64) -> Self {
         let mut game_config = jetgame::config::GameConfig::default();
-        game_config.rules.bot_count = 0;
         game_config.rules.cover_count = 0;
         game_config.rules.round_seconds = 120.;
         let world = jetgame::game::World::configured(
@@ -62,6 +62,7 @@ impl Replica {
             &game_config,
         );
         Self {
+            ui: None,
             client: NetworkClient::new(config()),
             game: Default::default(),
             world,
@@ -79,28 +80,45 @@ impl Replica {
         self.client.submit(request).unwrap();
     }
     fn flush(&mut self) {
+        if let Some(ui) = &mut self.ui {
+            let requests = ui.take_network_requests();
+            for request in requests {
+                self.game.note_request(&request);
+                self.client.submit(request).unwrap();
+            }
+        }
         for request in self.game.take_requests() {
             self.client.submit(request).unwrap();
         }
     }
     fn pump(&mut self) {
         for event in self.client.poll() {
+            if self
+                .ui
+                .as_ref()
+                .is_some_and(|ui| !ui.accepts_network_event(&event))
+            {
+                continue;
+            }
             self.game
                 .handle(&event, &mut self.world, &self.config)
                 .unwrap();
-            match event {
+            match &event {
                 NetworkEvent::Connected { endpoint, .. } => {
                     self.connected = true;
-                    self.endpoint = Some(endpoint);
+                    self.endpoint = Some(endpoint.clone());
                 }
                 NetworkEvent::ShareLink { link, scope, .. } => {
-                    assert_eq!(scope, LinkScope::Local);
-                    self.link = Some(link);
+                    assert_eq!(*scope, LinkScope::Local);
+                    self.link = Some(link.clone());
                 }
                 NetworkEvent::Lobby { players, .. } => self.ready = players.iter().all(|p| p.ready),
                 NetworkEvent::Error { message, .. } => panic!("{message}"),
                 NetworkEvent::Disconnected { .. } => self.disconnected = true,
                 _ => {}
+            }
+            if let Some(ui) = &mut self.ui {
+                ui.network_event(event);
             }
         }
         self.flush();
@@ -149,6 +167,83 @@ fn wait_pair(
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+#[test]
+#[ignore = "requires Python 3.11+ and local sockets"]
+fn default_ui_hosts_joins_and_spawns_a_real_multiplayer_round_without_bots() {
+    use jetgame::ui::{Screen, UiController, UiKey};
+    fn keys(ui: &mut UiController, keys: &[UiKey]) {
+        for key in keys {
+            ui.key(*key);
+        }
+    }
+    let mut host = Replica::new(2);
+    let mut guest = Replica::new(2);
+    let mut ui = UiController::default();
+    keys(&mut ui, &[UiKey::Enter, UiKey::Enter]);
+    assert_eq!(ui.screen(), Screen::ServerBrowser);
+    keys(
+        &mut ui,
+        &[UiKey::Down, UiKey::Down, UiKey::Down, UiKey::Enter],
+    );
+    assert_eq!(ui.screen(), Screen::Host);
+    keys(
+        &mut ui,
+        &[
+            UiKey::Down,
+            UiKey::Down,
+            UiKey::Down,
+            UiKey::Down,
+            UiKey::Enter,
+        ],
+    );
+    assert_eq!(ui.screen(), Screen::Joining);
+    host.ui = Some(ui);
+    wait_pair(&mut host, &mut guest, |h, _| {
+        h.connected && h.link.is_some()
+    });
+    assert_eq!(host.ui.as_ref().unwrap().screen(), Screen::Lobby);
+
+    let mut ui = UiController::default();
+    keys(&mut ui, &[UiKey::Enter, UiKey::Enter]);
+    ui.connect_direct(host.link.clone().unwrap());
+    guest.ui = Some(ui);
+    wait_pair(&mut host, &mut guest, |_, g| g.connected);
+    guest.ui.as_mut().unwrap().key(UiKey::Enter); // Ready
+    wait_pair(&mut host, &mut guest, |h, g| h.ready && g.ready);
+    keys(host.ui.as_mut().unwrap(), &[UiKey::Down, UiKey::Enter]); // Start
+    wait_pair(&mut host, &mut guest, |h, g| {
+        h.game.is_active() && g.game.is_active()
+    });
+    assert_eq!(host.world.rules.bot_count, 0);
+    assert_eq!(host.ui.as_ref().unwrap().screen(), Screen::Spawn);
+    assert_eq!(guest.ui.as_ref().unwrap().screen(), Screen::Spawn);
+    keys(
+        host.ui.as_mut().unwrap(),
+        &[UiKey::Down, UiKey::Down, UiKey::Enter],
+    );
+    keys(
+        guest.ui.as_mut().unwrap(),
+        &[UiKey::Right, UiKey::Down, UiKey::Down, UiKey::Enter],
+    );
+    drive(&mut host, &mut guest, 45, &Default::default());
+    assert_eq!(host.world.actors.iter().filter(|a| a.alive()).count(), 2);
+    assert_eq!(guest.world.actors.iter().filter(|a| a.alive()).count(), 2);
+    assert!(host.world.actors[1].alive());
+    let position = host.world.actors[1].body.position;
+    drive(&mut host, &mut guest, 75, &Default::default());
+    assert!(host.world.actors[1].body.position.distance(position) > 100.);
+    assert!(
+        guest.world.actors[1]
+            .body
+            .position
+            .distance(host.world.actors[1].body.position)
+            < 100.
+    );
+    host.send(Request::Leave);
+    wait_pair(&mut host, &mut guest, |_, g| g.disconnected);
+    assert_eq!(guest.ui.as_ref().unwrap().screen(), Screen::ServerBrowser);
+}
+
 #[test]
 #[ignore = "requires Python 3.11+ and local sockets"]
 fn python_udp_gameplay_has_host_authority_prediction_late_join_and_restart() {
@@ -294,4 +389,34 @@ fn python_configuration_failures_are_reported_to_rust() {
         &mut client,
         |e| matches!(e,NetworkEvent::Error { message,.. } if message.contains("host_port")),
     );
+}
+
+#[test]
+#[ignore = "requires bundled Python and local sockets"]
+fn normal_launcher_configuration_hosts_with_bundled_python_in_both_profiles() {
+    let mut config = NetworkConfig::load_default().unwrap();
+    config.set("host_port", 0);
+    config.set("lan_enabled", false);
+    let mut client = NetworkClient::new(config);
+    client
+        .submit(Request::Host {
+            op: 1,
+            options: HostOptions {
+                name: "LAUNCHER CHECK".into(),
+                max_players: 8,
+                map: "WORLD 01".into(),
+                mode: "TEAM DOGFIGHT".into(),
+            },
+        })
+        .unwrap();
+    let event = wait(&mut client, |e| {
+        matches!(
+            e,
+            NetworkEvent::Connected { .. } | NetworkEvent::WorkerStopped { .. }
+        )
+    });
+    assert!(
+        matches!(event, NetworkEvent::Connected { info, .. } if info.host && info.name == "LAUNCHER CHECK")
+    );
+    client.submit(Request::Leave).unwrap();
 }

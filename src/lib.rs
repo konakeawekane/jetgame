@@ -1,4 +1,4 @@
-//! Engine scaffolding. Rendering algorithms and gameplay are developed separately.
+//! Lightweight jet combat engine with a Python networking bridge.
 
 pub mod app;
 pub mod audio;

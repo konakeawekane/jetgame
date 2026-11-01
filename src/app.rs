@@ -26,7 +26,6 @@ pub struct RunOptions {
     pub smoke_test: bool,
     pub preview: bool,
     pub mesh: PathBuf,
-    pub offline: bool,
     pub network: NetworkConfig,
     pub connect: Option<String>,
     pub game: GameConfig,
@@ -37,7 +36,6 @@ impl Default for RunOptions {
             smoke_test: false,
             preview: false,
             mesh: "assets/f-16_fighter_jet.glb".into(),
-            offline: false,
             network: NetworkConfig::default(),
             connect: None,
             game: GameConfig::default(),
@@ -67,10 +65,9 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let audio = RadarAudio::new();
     let mut input = FlightInput::default();
     let mut ui = UiController::default();
-    let mut network = if options.offline || options.preview {
+    let mut network = if options.preview {
         None
     } else {
-        ui.enable_networking();
         Some(NetworkClient::new(options.network))
     };
     let mut multiplayer = Multiplayer::default();
@@ -90,7 +87,6 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let mut next_tick = start;
     let mut next_present = start;
     let mut previous_screen = ui.screen();
-    let mut first_spawn = !options.preview;
     let mut camera_life = world.actors[world.local_actor].life;
     let mut frame_index = 0;
     let mut cursor = [0_f32; 2];
@@ -173,7 +169,7 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                                 KeyCode::KeyF if !event.repeat => {
                                     if multiplayer.is_active() {
                                         multiplayer.swap_weapon();
-                                    } else {
+                                    } else if options.preview {
                                         world.swap_weapon();
                                     }
                                 }
@@ -229,7 +225,7 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                                     .distance(renderer.scene.camera.target)
                             - world.actors[world.local_actor].body.position)
                             .normalize();
-                        if !multiplayer.is_active() {
+                        if options.preview {
                             world.advance(
                                 now.duration_since(previous_simulation).as_secs_f64(),
                                 &input,
@@ -271,6 +267,7 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
                         Ok(true) => {
                             frame_index += 1;
                             if options.smoke_test && frame_index >= 3 {
+                                #[cfg(debug_assertions)]
                                 println!("Smoke test presented {frame_index} frames with UI");
                                 target.exit();
                             }
@@ -432,22 +429,13 @@ pub fn run(options: RunOptions) -> Result<(), Box<dyn Error>> {
             audio.update(0, ui.settings.volume);
             match screen {
                 Screen::Spawn => {
-                    if !multiplayer.is_active()
-                        && matches!(previous_screen, Screen::Joining | Screen::Lobby)
-                    {
-                        world.reset(ui.team());
-                        first_spawn = true;
-                    } else if !multiplayer.is_active() && previous_screen == Screen::Pause {
+                    if options.preview && previous_screen == Screen::Pause {
                         world.request_respawn();
                     }
                     assets.preview_scene(&mut renderer.scene);
                 }
                 Screen::Gameplay if previous_screen == Screen::Spawn => {
-                    if first_spawn && !multiplayer.is_active() {
-                        world.reset(ui.team());
-                        first_spawn = false;
-                    }
-                    if !multiplayer.is_active() {
+                    if options.preview {
                         world.respawn_player(ui.team());
                     }
                     assets.sync_scene(&world, &mut renderer.scene);

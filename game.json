@@ -14,7 +14,7 @@
   },
   "rules": {
     "physics_hz": 120,
-    "bot_count": 3,
+    "bot_count": 0,
     "round_seconds": 180.0,
     "kill_limit": 5,
     "max_projectiles": 256,
